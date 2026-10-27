@@ -1,0 +1,24 @@
+# PostgreSQL 16 para ADA Study (ADR-0001: única fuente de estado).
+# Uso: docker compose up -d
+# La base se crea vacía; el esquema se aplica con:
+#   python -m ada_study.db.create_schema "$DATABASE_URL"
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ada_study_postgres
+    environment:
+      POSTGRES_USER: ada
+      POSTGRES_PASSWORD: ada_dev_password
+      POSTGRES_DB: ada_study
+    ports:
+      - "5432:5432"
+    volumes:
+      - ada_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ada_dev"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  ada_pgdata:
