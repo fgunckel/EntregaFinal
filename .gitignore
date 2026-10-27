@@ -1,0 +1,21 @@
+ADA_Study_Spec_Kit/AGENTS.md
+ADA_Study_Spec_Kit/ESTRUCTURA_CARPETAS.md
+ADA_Study_Spec_Kit/README.md
+ADA_Study_Spec_Kit/prompts/00_audit_readonly_sources.md
+ADA_Study_Spec_Kit/prompts/task_template.md
+ADA_Study_Spec_Kit/specs/00_PRODUCT.md
+ADA_Study_Spec_Kit/specs/01_ARCHITECTURE.md
+ADA_Study_Spec_Kit/specs/02_INCREMENTAL_RAG.md
+ADA_Study_Spec_Kit/specs/03_STUDY_CENTER.md
+ADA_Study_Spec_Kit/specs/04_WEB_FALLBACK.md
+ADA_Study_Spec_Kit/specs/05_TESTING_AND_DELIVERY.md
+ADA_Study_Spec_Kit/specs/06_COMMUNITY_ACCESS_AND_MODERATION.md
+ADA_Study_Spec_Kit/specs/ADR-001-storage-and-hybrid-retrieval.md
+ADA_Study_Spec_Kit/tasks/TASK-00-audit.md
+ADA_Study_Spec_Kit/tasks/TASK-01-contracts.md
+ADA_Study_Spec_Kit/tasks/TASK-02-document-catalog.md
+ADA_Study_Spec_Kit/tasks/TASK-03-incremental-ingestion.md
+ADA_Study_Spec_Kit/tasks/TASK-04-community-access.md
+
+# Evidence Pack privado de Globant (no forma parte de la entrega académica)
+docs/evidence_globant/
