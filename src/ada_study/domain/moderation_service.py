@@ -107,21 +107,31 @@ class ModerationService:
             raise InvalidTransitionError(
                 "editorial", document.editorial_status, target
             )
-        updated = await self._repo.update_editorial_status(
-            document_id, document.editorial_status, target
-        )
+        await self._repo.update_editorial_status(document_id, target)
+        updated = await self._repo.get_document(document_id)
         if action == "withdraw":
             # Desindexación inmediata (Spec 06 §104): ops por destino para
-            # retirar los vectores/chunks del contenido retirado.
-            for destination in ("pinecone", "bm25"):
-                await self._repo.enqueue_pending_op(
-                    PendingIndexOp(
-                        op_id=_new_id("op"),
-                        version_id=document.active_version_id,
-                        destination=destination,
-                        operation="deindex",
+            # retirar los vectores/chunks del contenido retirado. Igual que
+            # en el borrado (ADR-0004): se cubre la versión activa Y toda
+            # versión en curso (queued/processing/indexing), que podría
+            # indexarse después; la cortina del worker la detiene y estas
+            # ops garantizan la purga física.
+            version_ids = (
+                {document.active_version_id} if document.active_version_id else set()
+            )
+            for version in await self._repo.list_versions(document_id):
+                if version.status in {"queued", "processing", "indexing"}:
+                    version_ids.add(version.version_id)
+            for version_id in version_ids:
+                for destination in ("pinecone", "bm25"):
+                    await self._repo.enqueue_pending_op(
+                        PendingIndexOp(
+                            op_id=_new_id("op"),
+                            version_id=version_id,
+                            destination=destination,
+                            operation="delete",
+                        )
                     )
-                )
         await self._audit(
             actor_id=actor.user_id,
             action=f"moderation.{action}",

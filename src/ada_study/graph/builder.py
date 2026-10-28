@@ -143,13 +143,19 @@ def route_after_validator(state: dict) -> str:
     return "limited_finish"
 
 
-def build_graph(chat_model=None, retriever=None):
-    """Construye el grafo de estudio con enrutado condicional (mecánica M7)."""
+def build_graph(chat_model=None, retriever=None, tutor_model=None):
+    """Construye el grafo de estudio con enrutado condicional (mecánica M7).
+
+    `chat_model` queda reservado para el supervisor (None = enrutado
+    determinístico, decisión aprobada TASK-11); `tutor_model` se inyecta
+    SOLO en el tutor para redactar la explicación (None = composición
+    determinística).
+    """
     graph = StateGraph(AgentState)
 
     graph.add_node("supervisor", make_supervisor_node(chat_model))
     graph.add_node("researcher", make_researcher_node(retriever))
-    graph.add_node("tutor", make_tutor_node())
+    graph.add_node("tutor", make_tutor_node(tutor_model))
     graph.add_node("validator", validator_node)
     graph.add_node("synthesizer", synthesizer_node)
     graph.add_node("limited_finish", limited_finish_node)
@@ -189,6 +195,13 @@ def build_graph(chat_model=None, retriever=None):
     return graph
 
 
-def compile_graph(chat_model=None, retriever=None):
-    """Construye y compila el grafo de estudio."""
-    return build_graph(chat_model=chat_model, retriever=retriever).compile()
+def compile_graph(chat_model=None, retriever=None, tutor_model=None):
+    """Construye y compila el grafo de estudio.
+
+    `chat_model` (supervisor) permanece None en producción (enrutado
+    determinístico, decisión TASK-11); `tutor_model` es el chat model del
+    tutor, construido una vez por proceso.
+    """
+    return build_graph(
+        chat_model=chat_model, retriever=retriever, tutor_model=tutor_model
+    ).compile()

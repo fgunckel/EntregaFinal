@@ -1,7 +1,7 @@
 # ADR-0005 — Códigos de error estables y estados de documento/versión/job
 
 - Estado: Propuesto (espera aprobación del usuario). Alineado con Specs 02/06.
-- Fecha: 2026-10-25 (rev. 2 — integración Spec Kit v6)
+- Fecha: 2026-10-27 (rev. 3 — códigos del dominio de estudio)
 
 ## Contexto
 
@@ -64,6 +64,21 @@ Formato: `ING_<CAUSA>` para ingesta, `DEL_<CAUSA>` para borrado/retirada, `MOD_<
 | `MOD_NOT_ALLOWED` | Usuario sin rol de moderador intenta una acción de moderación | 403 |
 | `MOD_INVALID_TRANSITION` | Acción de moderación inválida para el estado editorial actual | 409 |
 
+### Códigos de error del dominio de estudio (`STUDY_<CAUSA>`, rev. 3)
+
+Errores del flujo pedagógico `POST /api/study` (TASK-10). Formato: `STUDY_<CAUSA>`. Nunca contienen texto de excepción ni exponen contenido de documentos. La insuficiencia de evidencia **no** es un error HTTP: se expresa mediante el contrato de respuesta pedagógica (`StudyResponse.status`), no mediante excepción.
+
+| Código | Causa | HTTP | Notas |
+|---|---|---|---|
+| `STUDY_EMPTY_REQUEST` | Consulta vacía o solo espacios | 422 | Emitido por el runtime; el endpoint también lo recibe si la validación de Pydantic no alcanzó a rechazar antes |
+| `STUDY_REQUEST_TOO_LONG` | Consulta que excede `MAX_REQUEST_CHARS` | 422 | Emitido por el runtime; el endpoint rechaza antes mediante Pydantic (`max_length` de `StudyRequest`), por lo que este código **no se emite actualmente desde la frontera HTTP** — queda reservado para uso directo del runtime |
+| `STUDY_RETRIEVAL_UNAVAILABLE` | Fallo accediendo al catálogo para recolectar evidencia | 503 | Sin detalles internos; el detalle va a logs/trazas |
+| `STUDY_INTERNAL` | Fallo de ejecución del grafo o terminación sin respuesta publicada | 503 | Catch-all del dominio pedagógico (consolidación rev. 3: las antiguas variantes `STUDY_GRAPH_FAILED` y `STUDY_NO_RESPONSE` se colapsaron aquí; el cliente no puede actuar distinto ante ellas) |
+| `STUDY_NO_EVIDENCE` | Sin evidencia recuperable para la consulta | — | Código contractual (`StudyErrorCode` en `contracts/study.py`); hoy la ausencia total de evidencia se expresa vía `StudyResponse.status` (p. ej. `limited`), no como error HTTP |
+| `STUDY_INSUFFICIENT_EVIDENCE` | Evidencia recuperada insuficiente | — | Código contractual (`StudyErrorCode`); hoy la insuficiencia se expresa vía `StudyResponse.status` (`insufficient_evidence`), no como error HTTP |
+
+Nota: `StudyErrorCode` (contratos) contiene solo `STUDY_NO_EVIDENCE`, `STUDY_INSUFFICIENT_EVIDENCE` y `STUDY_INTERNAL`. Los tres códigos de frontera HTTP (`STUDY_EMPTY_REQUEST`, `STUDY_REQUEST_TOO_LONG`, `STUDY_RETRIEVAL_UNAVAILABLE`) se emiten como strings estables desde `StudyRuntimeError` y **no** se agregan al contrato tipado por ahora (extensión pospuesta a TASK-11).
+
 ### Reglas
 
 1. **Nunca exponer `str(exception)` al cliente:** la API mapea excepciones a códigos; el detalle va a logs/trazas (corrigiendo el patrón de texto libre de M7 en `app/main.py`).
@@ -81,5 +96,6 @@ Formato: `ING_<CAUSA>` para ingesta, `DEL_<CAUSA>` para borrado/retirada, `MOD_<
 
 ## Historial de revisión
 
+- **Rev. 3 (2026-10-27):** se agregan los códigos del dominio de estudio (`STUDY_*`) para `POST /api/study` (TASK-10): `STUDY_EMPTY_REQUEST`, `STUDY_REQUEST_TOO_LONG` (no emitido desde la frontera HTTP: Pydantic rechaza antes), `STUDY_RETRIEVAL_UNAVAILABLE`, `STUDY_INTERNAL` (consolidación de las variantes `STUDY_GRAPH_FAILED`/`STUDY_NO_RESPONSE` de la implementación inicial) y se documentan los códigos contractuales `STUDY_NO_EVIDENCE`/`STUDY_INSUFFICIENT_EVIDENCE` (expresados vía `StudyResponse.status`, no como errores HTTP). La extensión tipada de `StudyErrorCode` queda pospuesta a TASK-11.
 - **Rev. 2 (2026-10-25):** integración Spec Kit v6. Cambios: separación en dos enums (editorial `EditorialStatus` y técnico `VersionStatus`) según Spec 06 §59-71; se agrega `indexing` al ciclo técnico y `ReviewStatus`; se agregan códigos `MOD_*` para moderación; `ING_DUPLICATE` referenciado a la política de dedup de ADR-0001; regla de visibilidad editorial+técnico.
 - **Rev. 1 (2026-10-25):** versión inicial de TASK-01 (un único `DocumentStatus` técnico).

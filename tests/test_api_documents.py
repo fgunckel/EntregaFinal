@@ -123,6 +123,12 @@ class FakeApiRepository:
             raise NotFoundError("Versión", version_id)
         return self.versions[version_id]
 
+    async def list_versions(self, document_id: str) -> list[DocumentVersion]:
+        return sorted(
+            (v for v in self.versions.values() if v.document_id == document_id),
+            key=lambda v: v.version_number,
+        )
+
     async def list_documents(self) -> list[DocumentRecord]:
         return sorted(self.documents.values(), key=lambda d: d.created_at)
 
@@ -194,6 +200,15 @@ class FakeApiRepository:
     ) -> None:
         self.jobs[job_id].status = status
         self.jobs[job_id].error_code = error_code
+
+    async def update_editorial_status(
+        self, document_id: str, target: str
+    ) -> None:
+        document = self.documents[document_id]
+        document.editorial_status = target
+        document.updated_at = datetime.now(UTC).isoformat()
+        if target == "deleted":
+            document.deleted_at = datetime.now(UTC).isoformat()
 
     # -- identidad --------------------------------------------------------
 
@@ -656,3 +671,206 @@ class TestIngestionFlowWithSeparateWorker:
                 f"/api/documents/{upload.json()['document_id']}", headers=_auth(token)
             )
             assert detail.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# E2: borrado, reintento y restauración (TASK-07)
+# ---------------------------------------------------------------------------
+
+
+class TestDeleteDocument:
+    async def test_author_deletes_own_document_202_with_curtain(self):
+        repo = FakeApiRepository()
+        user = _user("usr_del", "student")
+        repo.users[user.user_id] = user
+        token = _session_token(repo, user)
+        with _client(repo) as client:
+            upload = client.post(
+                "/api/documents",
+                headers={**_auth(token), "Content-Type": "application/pdf"},
+                content=PDF,
+            )
+            assert upload.status_code == 202
+            document_id = upload.json()["document_id"]
+            version_id = upload.json()["version_id"]
+            # Simula una ingesta completada: la versión está activa y
+            # disponible, por lo que hay vectores/chunks que purgar.
+            await repo.set_active_version(document_id, version_id)
+
+            response = client.delete(f"/api/documents/{document_id}", headers=_auth(token))
+        assert response.status_code == 202
+        body = response.json()
+        assert body["editorial_status"] == "deleted"
+        assert body["purge"] == "enqueued"
+        # Cortina inmediata: el documento ya no es visible en el listado.
+        listing = client.get("/api/documents", headers=_auth(token))
+        visible_ids = {d["document_id"] for d in listing.json()["documents"]}
+        assert document_id not in visible_ids
+        # Purga encolada en el outbox por destino.
+        deindex_ops = [
+            op for op in repo.pending_ops.values() if op.operation == "delete"
+        ]
+        assert len(deindex_ops) == 2  # pinecone + bm25
+
+    async def test_deleted_document_not_recoverable_404(self):
+        repo = FakeApiRepository()
+        user = _user("usr_del2", "student")
+        repo.users[user.user_id] = user
+        token = _session_token(repo, user)
+        with _client(repo) as client:
+            upload = client.post(
+                "/api/documents",
+                headers={**_auth(token), "Content-Type": "application/pdf"},
+                content=PDF,
+            )
+            document_id = upload.json()["document_id"]
+            deleted = client.delete(
+                f"/api/documents/{document_id}", headers=_auth(token)
+            )
+            assert deleted.status_code == 202
+            # El detalle responde 404: no recuperable (Spec 05 esc. 5).
+            detail = client.get(f"/api/documents/{document_id}", headers=_auth(token))
+            assert detail.status_code == 404
+            # Borrar de nuevo: 409 (transición deleted -> deleted inválida).
+            again = client.delete(f"/api/documents/{document_id}", headers=_auth(token))
+            assert again.status_code == 409
+
+    async def test_other_user_cannot_delete_foreign_document_404(self):
+        repo = FakeApiRepository()
+        owner = _user("usr_owner", "student")
+        other = _user("usr_other", "student")
+        repo.users[owner.user_id] = owner
+        repo.users[other.user_id] = other
+        token_owner = _session_token(repo, owner)
+        token_other = _session_token(repo, other)
+        with _client(repo) as client:
+            upload = client.post(
+                "/api/documents",
+                headers={**_auth(token_owner), "Content-Type": "application/pdf"},
+                content=PDF,
+            )
+            document_id = upload.json()["document_id"]
+            response = client.delete(
+                f"/api/documents/{document_id}", headers=_auth(token_other)
+            )
+        assert response.status_code == 404  # no revela existencia (Spec 06 §41)
+
+    async def test_moderator_can_delete_any_document_202(self):
+        repo = FakeApiRepository()
+        owner = _user("usr_own", "student")
+        moderator = _user("usr_mod", "moderator")
+        repo.users[owner.user_id] = owner
+        repo.users[moderator.user_id] = moderator
+        token_owner = _session_token(repo, owner)
+        token_mod = _session_token(repo, moderator)
+        with _client(repo) as client:
+            upload = client.post(
+                "/api/documents",
+                headers={**_auth(token_owner), "Content-Type": "application/pdf"},
+                content=PDF,
+            )
+            document_id = upload.json()["document_id"]
+            response = client.delete(
+                f"/api/documents/{document_id}", headers=_auth(token_mod)
+            )
+        assert response.status_code == 202
+
+
+class TestRetryVersion:
+    async def test_retry_failed_version_202_and_idempotent(self):
+        repo = FakeApiRepository()
+        user = _user("usr_retry", "student")
+        repo.users[user.user_id] = user
+        token = _session_token(repo, user)
+        with _client(repo) as client:
+            upload = client.post(
+                "/api/documents",
+                headers={**_auth(token), "Content-Type": "application/pdf"},
+                content=PDF,
+            )
+            document_id = upload.json()["document_id"]
+            version_id = upload.json()["version_id"]
+            # La versión falla (p. ej. error de extracción).
+            await repo.mark_version_failed(version_id, "ING_INTERNAL")
+            first = client.post(
+                f"/api/documents/{document_id}/versions/{version_id}/retry",
+                headers=_auth(token),
+            )
+            assert first.status_code == 202
+            assert first.json()["status"] == "queued"
+            # Idempotente: reintentar de nuevo sobre `queued` responde 200
+            # sin crear un segundo job.
+            jobs_before = len(repo.jobs)
+            second = client.post(
+                f"/api/documents/{document_id}/versions/{version_id}/retry",
+                headers=_auth(token),
+            )
+            assert second.status_code == 200
+            assert len(repo.jobs) == jobs_before
+
+    async def test_retry_non_failed_version_rejected_409(self):
+        repo = FakeApiRepository()
+        user = _user("usr_retry409", "student")
+        repo.users[user.user_id] = user
+        token = _session_token(repo, user)
+        with _client(repo) as client:
+            upload = client.post(
+                "/api/documents",
+                headers={**_auth(token), "Content-Type": "application/pdf"},
+                content=PDF,
+            )
+            document_id = upload.json()["document_id"]
+            version_id = upload.json()["version_id"]
+            # La versión está `queued` (no failed): el reintento es inválido.
+            response = client.post(
+                f"/api/documents/{document_id}/versions/{version_id}/retry",
+                headers=_auth(token),
+            )
+            assert response.status_code == 409
+
+
+class TestRestoreVersion:
+    async def test_restore_creates_new_version_and_keeps_history(self):
+        repo = FakeApiRepository()
+        user = _user("usr_restore", "student")
+        repo.users[user.user_id] = user
+        token = _session_token(repo, user)
+        with _client(repo) as client:
+            upload = client.post(
+                "/api/documents",
+                headers={**_auth(token), "Content-Type": "application/pdf"},
+                content=PDF,
+            )
+            document_id = upload.json()["document_id"]
+            version_id = upload.json()["version_id"]
+            response = client.post(
+                f"/api/documents/{document_id}/versions/{version_id}/restore",
+                headers=_auth(token),
+            )
+            assert response.status_code == 202
+            restored_id = response.json()["restored_version_id"]
+            assert restored_id != version_id
+            restored = repo.versions[restored_id]
+            assert restored.status == "queued"
+            assert restored.version_number == 2
+            # El historial no se modifica: la versión original sigue igual.
+            assert repo.versions[version_id].version_number == 1
+            assert len(repo.versions) == 2
+
+    async def test_restore_unknown_version_404(self):
+        repo = FakeApiRepository()
+        user = _user("usr_restore404", "student")
+        repo.users[user.user_id] = user
+        token = _session_token(repo, user)
+        with _client(repo) as client:
+            upload = client.post(
+                "/api/documents",
+                headers={**_auth(token), "Content-Type": "application/pdf"},
+                content=PDF,
+            )
+            document_id = upload.json()["document_id"]
+            response = client.post(
+                f"/api/documents/{document_id}/versions/ver_inexistente/restore",
+                headers=_auth(token),
+            )
+            assert response.status_code == 404

@@ -22,7 +22,11 @@ from fastapi.responses import JSONResponse
 from ada_study.api.dependencies import get_current_user
 from ada_study.config import Settings
 from ada_study.contracts.identity import UserRecord
-from ada_study.db.repository import CatalogError, NotFoundError
+from ada_study.db.repository import (
+    CatalogError,
+    InvalidTransitionError,
+    NotFoundError,
+)
 from ada_study.domain.catalog_service import CatalogService
 from ada_study.domain.identity_service import ForbiddenError
 
@@ -124,6 +128,7 @@ async def upload_document(
             content_type=content_type,
             subject=subject,
             uploaded_by=user.user_id,
+            uploader_role=user.role,
         )
     except CatalogError as exc:
 
@@ -162,6 +167,8 @@ async def list_documents(
     documents = await request.app.state.ada.repository.list_documents()
     visible = []
     for document in documents:
+        if document.editorial_status == "deleted":
+            continue  # cortina editorial: un borrado no se lista (Spec 06 §104)
         is_own = document.uploaded_by == user.user_id
         is_shared = document.editorial_status in ("published", "published_pending_review")
         if user.role in ("moderator", "admin") or is_own or is_shared:
@@ -202,6 +209,14 @@ async def get_document(
     if user.role not in ("moderator", "admin") and not (is_own or is_shared):
 
         # 404 (no 403): no se revela la existencia del recurso (Spec 06 §41).
+        return JSONResponse(
+            status_code=404,
+            content=_error_payload("DEL_NOT_FOUND", f"Documento {document_id} no existe"),
+        )
+
+    if document.editorial_status == "deleted":
+        # Cortina editorial: un documento borrado no es recuperable,
+        # ni siquiera para su autor o un moderador (Spec 05 esc. 5).
         return JSONResponse(
             status_code=404,
             content=_error_payload("DEL_NOT_FOUND", f"Documento {document_id} no existe"),
@@ -248,3 +263,203 @@ async def get_ingestion_job(
         )
 
     return JSONResponse(status_code=200, content=job.model_dump())
+
+
+# ---------------------------------------------------------------------------
+# E2: borrado, reintento y restauración (TASK-07, ADR-0004/0006)
+# ---------------------------------------------------------------------------
+
+
+def _can_see_document(user: UserRecord, document) -> bool:
+    """Visibilidad editorial + técnica (Spec 06 §106)."""
+    is_own = document.uploaded_by == user.user_id
+    is_shared = document.editorial_status in ("published", "published_pending_review")
+    return user.role in ("moderator", "admin") or is_own or is_shared
+
+
+@router.delete("/documents/{document_id}", status_code=202)
+async def delete_document(
+    document_id: str,
+    request: Request,
+    user: Annotated[UserRecord, Depends(get_current_user)],
+):
+    """Borrado con cortina editorial inmediata + purga eventual (ADR-0004).
+
+    - 202 Accepted: la cortina (`deleted`) se aplica en la petición y la
+      recuperación excluye el documento al instante (Spec 06 §104); la purga
+      física (vectores, chunks, archivo huérfano) queda encolada en el outbox.
+    - Autorización: solo el autor o moderator/admin (Spec 06 §106).
+    - Idempotente en la práctica: un documento ya `deleted` responde 404
+      (la transición deleted -> deleted no es válida, ADR-0005).
+    """
+    from ada_study.domain import permissions
+
+    if not permissions.has_permission(user.role, "documents:read_own"):
+        raise ForbiddenError("documents:read_own")
+
+    repository = request.app.state.ada.repository
+    try:
+        document = await repository.get_document(document_id)
+    except NotFoundError as exc:
+        return JSONResponse(
+            status_code=404,
+            content=_error_payload("DEL_NOT_FOUND", str(exc)),
+        )
+    if not _can_see_document(user, document):
+        # 404 (no 403): no se revela la existencia del recurso (Spec 06 §41).
+        return JSONResponse(
+            status_code=404,
+            content=_error_payload(
+                "DEL_NOT_FOUND", f"Documento {document_id} no existe"
+            ),
+        )
+    if document.uploaded_by != user.user_id and user.role not in ("moderator", "admin"):
+        return JSONResponse(
+            status_code=403,
+            content=_error_payload("DEL_NOT_ALLOWED", "Solo el autor puede borrar"),
+        )
+
+    try:
+        document = await _catalog(request).delete_document(document_id)
+    except InvalidTransitionError as exc:
+        return JSONResponse(
+            status_code=409,
+            content=_error_payload("DEL_CONFLICT", str(exc)),
+        )
+    return JSONResponse(
+        status_code=202,
+        content={
+            "document_id": document.document_id,
+            "editorial_status": document.editorial_status,
+            "deleted_at": document.deleted_at,
+            "purge": "enqueued",
+        },
+    )
+
+
+@router.post("/documents/{document_id}/versions/{version_id}/restore", status_code=202)
+async def restore_version(
+    document_id: str,
+    version_id: str,
+    request: Request,
+    user: Annotated[UserRecord, Depends(get_current_user)],
+):
+    """Restaura una versión histórica como versión NUEVA (Spec 02 §67).
+
+    - El historial no se modifica: la versión histórica conserva su estado.
+    - La nueva versión nace `queued` y debe pasar de nuevo por ingesta e
+      indexación antes de activarse (nunca se marca available aquí).
+    - Autorización: autor del documento o moderator/admin.
+    """
+    from ada_study.domain import permissions
+
+    if not permissions.has_permission(user.role, "documents:upload"):
+        raise ForbiddenError("documents:upload")
+
+    try:
+        document = await _catalog(request).get_document(document_id)
+    except NotFoundError as exc:
+        return JSONResponse(
+            status_code=404,
+            content=_error_payload("DEL_NOT_FOUND", str(exc)),
+        )
+    if not _can_see_document(user, document):
+        return JSONResponse(
+            status_code=404,
+            content=_error_payload("DEL_NOT_FOUND", f"Documento {document_id} no existe"),
+        )
+    if document.uploaded_by != user.user_id and user.role not in ("moderator", "admin"):
+        return JSONResponse(
+            status_code=403,
+            content=_error_payload("DEL_NOT_ALLOWED", "Solo el autor puede restaurar"),
+        )
+    if document.editorial_status == "deleted":
+        return JSONResponse(
+            status_code=409,
+            content=_error_payload(
+                "DEL_CONFLICT", "No se puede restaurar un documento eliminado"
+            ),
+        )
+
+    try:
+        restored = await _catalog(request).restore_version(document_id, version_id)
+    except NotFoundError as exc:
+        return JSONResponse(
+            status_code=404,
+            content=_error_payload("DEL_NOT_FOUND", str(exc)),
+        )
+    except InvalidTransitionError as exc:
+        return JSONResponse(
+            status_code=409,
+            content=_error_payload("DEL_CONFLICT", str(exc)),
+        )
+
+    return JSONResponse(
+        status_code=202,
+        content={
+            "document_id": document_id,
+            "restored_version_id": restored.version_id,
+            "status": restored.status,
+        },
+    )
+
+
+@router.post("/documents/{document_id}/versions/{version_id}/retry", status_code=202)
+async def retry_version(
+    document_id: str,
+    version_id: str,
+    request: Request,
+    user: Annotated[UserRecord, Depends(get_current_user)],
+):
+    """Reintento de ingesta de una versión `failed` (idempotente, Spec 02 §29).
+
+    - Solo aplica a versiones `failed`; sobre otro estado responde 409.
+    - Idempotente: si la versión ya fue reencolada, responde 200 con la
+      versión existente sin duplicar jobs.
+    """
+    from ada_study.domain import permissions
+
+    if not permissions.has_permission(user.role, "documents:upload"):
+        raise ForbiddenError("documents:upload")
+
+    try:
+        document = await _catalog(request).get_document(document_id)
+        version = await _catalog(request).get_version(version_id)
+    except NotFoundError as exc:
+        return JSONResponse(
+            status_code=404,
+            content=_error_payload("DEL_NOT_FOUND", str(exc)),
+        )
+    if version.document_id != document.document_id:
+        return JSONResponse(
+            status_code=404,
+            content=_error_payload("DEL_NOT_FOUND", f"Versión {version_id} no existe"),
+        )
+    if not _can_see_document(user, document):
+        return JSONResponse(
+            status_code=404,
+            content=_error_payload("DEL_NOT_FOUND", f"Documento {document_id} no existe"),
+        )
+    if document.uploaded_by != user.user_id and user.role not in ("moderator", "admin"):
+        return JSONResponse(
+            status_code=403,
+            content=_error_payload("DEL_NOT_ALLOWED", "Solo el autor puede reintentar"),
+        )
+
+    already_queued = version.status == "queued"
+    try:
+        retried = await _catalog(request).retry_version(version_id)
+    except InvalidTransitionError as exc:
+        return JSONResponse(
+            status_code=409,
+            content=_error_payload("DEL_CONFLICT", str(exc)),
+        )
+
+    return JSONResponse(
+        status_code=200 if already_queued else 202,
+        content={
+            "document_id": document_id,
+            "version_id": retried.version_id,
+            "status": retried.status,
+        },
+    )

@@ -24,12 +24,21 @@ from ada_study.storage.pdf_storage import PdfStorage
 class AdaState:
     """Estado de la app: engine y servicios compartidos."""
 
-    def __init__(self, engine, repository: CatalogRepository, storage: PdfStorage) -> None:
+    def __init__(
+        self,
+        engine,
+        repository: CatalogRepository,
+        storage: PdfStorage,
+        chat_model=None,
+    ) -> None:
         self.engine = engine
         self.repository = repository
         self.storage = storage
         self.catalog = CatalogService(repository=repository, storage=storage)
         self.identity = IdentityService(repository=repository)
+        # Chat model del tutor (TASK-11): construido UNA VEZ por proceso.
+        # None = modo determinístico (default seguro, sin llamadas ni costos).
+        self.chat_model = chat_model
 
 
 def create_app(
@@ -61,19 +70,37 @@ def create_app(
             return
         from sqlalchemy.ext.asyncio import create_async_engine
 
+        from ada_study.llm import build_chat_model
+
         engine = create_async_engine(resolved.database_url, echo=False)
         repository = CatalogRepository(engine=engine)
         storage = PdfStorage(root=resolved.ada_storage_dir)
-        app.state.ada = AdaState(engine=engine, repository=repository, storage=storage)
+        # Fail-fast (TASK-11): una configuración LLM inválida (proveedor
+        # desconocido, modelo o clave ausentes) corta el arranque, nunca una
+        # petición. Con ADA_LLM_PROVIDER=none (default) el modelo es None.
+        app.state.ada = AdaState(
+            engine=engine,
+            repository=repository,
+            storage=storage,
+            chat_model=build_chat_model(resolved),
+        )
         yield
         await engine.dispose()
 
     app = FastAPI(title="ADA Study API", version="0.1.0", lifespan=lifespan)
     app.state.settings = resolved
 
+    from ada_study.api.routes_audit import router as audit_router
+    from ada_study.api.routes_auth import router as auth_router
     from ada_study.api.routes_documents import router as documents_router
+    from ada_study.api.routes_moderation import router as moderation_router
+    from ada_study.api.routes_study import router as study_router
 
     app.include_router(documents_router)
+    app.include_router(moderation_router)
+    app.include_router(audit_router)
+    app.include_router(auth_router)
+    app.include_router(study_router)
 
     @app.exception_handler(IdentityError)
     async def identity_error_handler(request: Request, exc: IdentityError) -> JSONResponse:

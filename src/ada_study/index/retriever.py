@@ -29,6 +29,20 @@ from ada_study.index.bm25_index import BM25Index
 _VISIBLE_EDITORIAL = frozenset({"published", "published_pending_review"})
 
 
+class ViewerContext:
+    """Contexto de visibilidad del usuario que consulta.
+
+    Habilita el acceso privado del autor a su propio `pending_review`
+    (regla aprobada en TASK-07): el RAG compartido sigue excluyendo
+    pending_review (ADR-0005); este contexto solo amplía la recuperación
+    para el propietario del documento.
+    """
+
+    def __init__(self, user_id: str, role: str) -> None:
+        self.user_id = user_id
+        self.role = role
+
+
 class CatalogView(Protocol):
     """Vista de solo lectura del catálogo para verificación de visibilidad.
 
@@ -104,11 +118,16 @@ class HybridRetriever:
         bm25_index: BM25Index,
         vector_search=None,
         top_k: int = 5,
+        viewer: ViewerContext | None = None,
     ) -> None:
         self._catalog = catalog
         self._bm25 = bm25_index
         self._vector_search = vector_search
         self._top_k = top_k
+        # Visor opcional: habilita acceso privado del autor a su propio
+        # `pending_review` (regla aprobada en TASK-07; el RAG compartido
+        # sigue excluyendo pending_review, ADR-0005).
+        self._viewer = viewer
         # Índice chunk_id -> ChunkRecord, alimentado por `sync_chunks`.
         self._chunk_by_id: dict[str, ChunkRecord] = {}
 
@@ -127,12 +146,20 @@ class HybridRetriever:
     async def _is_visible(self, chunk: ChunkRecord) -> bool:
         """Re-verifica contra el catálogo que el chunk sea recuperable.
 
-        Excluye: documentos pendientes de aprobación, rechazados, retirados o
-        eliminados; versiones no activas o no `available`. Se aplica SIEMPRE,
-        también ante resultados residuales de Pinecone (Spec 06 §104).
+        Excluye: documentos pendientes de aprobación (salvo acceso privado
+        del autor, regla TASK-07), rechazados, retirados o eliminados;
+        versiones no activas o no `available`. Se aplica SIEMPRE, también
+        ante resultados residuales de Pinecone (Spec 06 §104).
         """
         document = await self._catalog.get_document(chunk.document_id)
-        if document.editorial_status not in _VISIBLE_EDITORIAL:
+        status = document.editorial_status
+        if status in _VISIBLE_EDITORIAL:
+            pass  # visible para todos los usuarios autorizados
+        elif status == "pending_review" and self._viewer is not None:
+            # Acceso privado: solo el propietario ve su pendiente de revisión.
+            if document.uploaded_by != self._viewer.user_id:
+                return False
+        else:
             return False
         if document.active_version_id != chunk.version_id:
             return False
@@ -145,7 +172,9 @@ class HybridRetriever:
         """Recuperación híbrida con filtros de visibilidad y procedencia.
 
         Devuelve fragmentos de documentos publicados con versión activa
-        `available`, fusionados por RRF y con procedencia completa.
+        `available`, fusionados por RRF y con procedencia completa. Si hay
+        `viewer`, incluye además el acceso privado del autor a su propio
+        `pending_review` (regla TASK-07).
         """
         if not query.strip():
             raise ValueError("La consulta no puede estar vacía")

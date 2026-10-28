@@ -19,7 +19,12 @@ from ada_study.contracts.documents import (
     IngestionJob,
     PendingIndexOp,
 )
-from ada_study.db.repository import CatalogRepository, DuplicateDocumentError
+from ada_study.db.repository import (
+    CatalogRepository,
+    DuplicateDocumentError,
+    InvalidTransitionError,
+)
+from ada_study.domain.state_rules import is_editorial_transition_valid
 from ada_study.storage.pdf_storage import PdfStorage
 
 
@@ -46,6 +51,7 @@ class CatalogService:
         content_type: str = "application/pdf",
         subject: str | None = None,
         uploaded_by: str | None = None,
+        uploader_role: str = "student",
     ) -> tuple[DocumentRecord, DocumentVersion, IngestionJob]:
         """Registra un documento nuevo con su versión inicial y job de ingesta.
 
@@ -57,6 +63,8 @@ class CatalogService:
           fusionar autoría, permisos ni historial.
         - La versión nace `queued`: no es recuperable hasta completar la
           ingesta (criterio de aceptación de TASK-02).
+        - Estado editorial inicial (Spec 06 §51): student nace
+          `pending_review` (no publica); moderator/admin nacen `draft`.
         """
         sha256 = self._storage.compute_sha256(content)
         existing = await self._repo.find_active_version_by_sha256(sha256)
@@ -66,12 +74,15 @@ class CatalogService:
             )
         _, storage_key = self._storage.save_pdf(content)
         now = _now_iso()
+        # Estado editorial inicial (Spec 06 §51): student no publica, su
+        # aporte nace pendiente de revisión; moderator/admin nacen draft.
+        initial_status = "draft" if uploader_role in ("moderator", "admin") else "pending_review"
         document = DocumentRecord(
             document_id=_new_id("doc"),
             filename=filename,
             subject=subject,
             active_version_id=None,
-            editorial_status="draft",
+            editorial_status=initial_status,
             review_status="not_required",
             uploaded_by=uploaded_by,
             created_at=now,
@@ -173,12 +184,94 @@ class CatalogService:
             )
         return restored
 
+    async def delete_document(self, document_id: str) -> DocumentRecord:
+        """Cortina editorial `deleted` + purga física vía outbox (ADR-0004).
+
+        - El borrado es INMEDIATO en la capa de aplicación: el documento pasa a
+          `deleted` (transición terminal, ADR-0005) y desaparece del listado y
+          de la recuperación al instante (Spec 06 §104).
+        - La purga física (vectores Pinecone, chunks BM25, archivo huérfano)
+          NO es síncrona: se encola como ops `deindex` en el outbox y el
+          worker la ejecuta eventualmente. Este método NO verifica destinos:
+          distinguir cortina (aquí) de eliminación física verificada (worker).
+        - El archivo físico NO se borra aquí: puede estar referenciado por
+          otras versiones (content-addressed); la purga de huérfanos es una
+          operación aparte del worker.
+        """
+        document = await self._repo.get_document(document_id)
+        if not is_editorial_transition_valid(document.editorial_status, "deleted"):
+            raise InvalidTransitionError(
+                "editorial", document.editorial_status, "deleted"
+            )
+        await self._repo.update_editorial_status(document_id, "deleted")
+        # Purga eventual (ADR-0004): desindexar en ambos destinos (Spec 06
+        # §104) la versión activa Y toda versión en curso (queued/processing/
+        # indexing): aunque aún no esté activa, puede estar parcialmente
+        # indexada o indexarse después; la cortina del worker la detiene y
+        # estas ops garantizan la purga física.
+        version_ids = {document.active_version_id} if document.active_version_id else set()
+        for version in await self._repo.list_versions(document_id):
+            if version.status in {"queued", "processing", "indexing"}:
+                version_ids.add(version.version_id)
+        for version_id in version_ids:
+            for destination in ("pinecone", "bm25"):
+                await self._repo.enqueue_pending_op(
+                    PendingIndexOp(
+                        op_id=_new_id("op"),
+                        version_id=version_id,
+                        destination=destination,
+                        operation="delete",
+                    )
+                )
+        updated = await self._repo.get_document(document_id)
+        return updated
+
+    async def retry_version(self, version_id: str) -> DocumentVersion:
+        """Reencola una versión `failed` (idempotente, Spec 02 §29).
+
+        - Solo aplica a versiones `failed`: cualquier otro estado lanza
+          InvalidTransitionError (la transición failed -> queued ya la
+          valida el repositorio contra `state_rules`).
+        - Idempotente: si la versión ya está `queued` (reintento previo),
+          devuelve la versión existente sin crear un segundo job.
+        - Reactiva las ops fallidas del outbox (conservan su contador de
+          intentos, specs/02 §29) y crea un job nuevo para polling.
+        """
+        version = await self._repo.get_version(version_id)
+        if version.status == "queued":
+            # Idempotente SOLO si ya existe un job de reintento previo (más de
+            # un job para la versión); un `queued` inicial (job único, nunca
+            # reintentada) no es reintentable.
+            prior_jobs = await self._repo.list_jobs_for_version(version_id)
+            if len(prior_jobs) > 1:
+                return version
+            raise InvalidTransitionError("version", version.status, "queued")
+        if version.status != "failed":
+            raise InvalidTransitionError("version", version.status, "queued")
+        await self._repo.update_version_status(version_id, "queued")
+        now = _now_iso()
+        job = IngestionJob(
+            job_id=_new_id("job"),
+            document_id=version.document_id,
+            version_id=version_id,
+            status="queued",
+            created_at=now,
+            updated_at=now,
+            error_code=None,
+        )
+        await self._repo.create_job(job)
+        await self._repo.reset_failed_ops(version_id)
+        return await self._repo.get_version(version_id)
+
     async def list_document_versions(self, document_id: str) -> list[DocumentVersion]:
         """Historial inmutable de versiones del documento."""
         return await self._repo.list_versions(document_id)
 
     async def get_document(self, document_id: str) -> DocumentRecord:
         return await self._repo.get_document(document_id)
+
+    async def get_version(self, version_id: str) -> DocumentVersion:
+        return await self._repo.get_version(version_id)
 
     async def get_job(self, job_id: str) -> IngestionJob:
         return await self._repo.get_job(job_id)

@@ -31,7 +31,8 @@ StudyResponseStatus = Literal["complete", "insufficient_evidence", "limited"]
 QuestionType = Literal["multiple_choice", "short_answer", "conceptual"]
 
 # ---------------------------------------------------------------------------
-# Códigos de error estables del dominio pedagógico (ADR-0005). Nunca contienen
+# Códigos de error estables del dominio pedagógico (documentados en ADR-0005
+# rev. 3, sección "Códigos de error del dominio de estudio"). Nunca contienen
 # texto de excepción ni exponen contenido de documentos de menores.
 # ---------------------------------------------------------------------------
 

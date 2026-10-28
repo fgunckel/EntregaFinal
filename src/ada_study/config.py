@@ -39,6 +39,19 @@ class Settings(BaseSettings):
     # Tipos de contenido aceptados en upload (ADR-0005 ING_UNSUPPORTED_TYPE)
     ada_allowed_content_types: str = "application/pdf"
 
+    # Proveedor LLM del tutor (TASK-11). "none" (default) = modo determinístico
+    # sin llamadas ni costos. La clave llega SOLO por entorno (.env); jamás se
+    # incluye en código, logs ni mensajes de error (sin secretos en el repo).
+    ada_llm_provider: str = "none"  # "none" | "openai"
+    ada_llm_model: str = ""  # obligatorio si provider != "none" (p. ej. gpt-5.4-mini)
+    ada_llm_api_key: str = ""  # alternativa: OPENAI_API_KEY; sin default inseguro
+    # Límites por llamada (política de costos TASK-11: máx. 1 llamada del tutor
+    # por intento; máx. 3 por petición con las 2 reparaciones del validator).
+    ada_llm_temperature: float = 0.0
+    ada_llm_max_tokens: int = Field(default=800, ge=1)
+    ada_llm_timeout_seconds: float = Field(default=20.0, gt=0)
+    ada_llm_max_retries: int = Field(default=2, ge=0)
+
 
 @lru_cache
 def get_settings() -> Settings:

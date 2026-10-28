@@ -565,6 +565,26 @@ class CatalogRepository:
             )
         return result.rowcount or 0
 
+    async def reset_failed_delete_ops(self, version_id: str) -> int:
+        """Reactiva SOLO las ops delete fallidas de una versión.
+
+        Bajo cortina editorial (ADR-0004): las ops index/reconcile fallidas
+        permanecen fallidas (recover() no reintroduce contenido tras la
+        cortina); las ops delete siguen siendo recuperables (purga
+        garantizada). Devuelve la cantidad de ops reactivadas.
+        """
+        async with self._connection() as conn:
+            result = await conn.execute(
+                update(pending_index_ops)
+                .where(
+                    pending_index_ops.c.version_id == version_id,
+                    pending_index_ops.c.status == "failed",
+                    pending_index_ops.c.operation == "delete",
+                )
+                .values(status="pending")
+            )
+        return result.rowcount or 0
+
     async def list_version_ids_with_pending_ops(self) -> list[str]:
         """Versiones con ops pendientes o fallidas (recuperación del worker).
 

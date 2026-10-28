@@ -129,6 +129,18 @@ class FakeRepository:
                 count += 1
         return count
 
+    async def reset_failed_delete_ops(self, version_id: str) -> int:
+        count = 0
+        for op in self.pending_ops.values():
+            if (
+                op.version_id == version_id
+                and op.status == "failed"
+                and op.operation == "delete"
+            ):
+                op.status = "pending"
+                count += 1
+        return count
+
     async def list_version_ids_with_pending_ops(self) -> list[str]:
         return sorted(
             {

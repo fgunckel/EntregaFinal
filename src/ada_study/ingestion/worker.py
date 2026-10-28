@@ -12,6 +12,13 @@ Consume el outbox (`pending_index_ops`) y ejecuta el ciclo por versión:
    los índices los chunks de la versión anterior y los elimina de
    PostgreSQL (specs/02 §48). El original y los metadatos se conservan
    para historial/restauración.
+5. Cortina editorial (ADR-0004, Spec 06 §104): si el documento está
+   `deleted` o `withdrawn`, la versión NO se indexa ni se activa. La
+   cortina se revalida al inicio del ciclo, antes de cada op
+   index/reconcile y antes de activar (cubre cambios concurrentes de
+   moderación/borrado durante el procesamiento). Bajo cortina solo se
+   ejecutan ops `delete` (idempotentes y reintentables); la purga queda
+   garantizada con ops `delete` persistidas para todos los destinos.
 
 Fallos parciales: cada destino registra su op con estado y contador de
 intentos; si uno falla, la versión queda `indexing` (no `available`) y
@@ -39,6 +46,11 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
 
 
+# Estados editoriales bajo cortina (ADR-0004, Spec 06 §104): ninguna
+# indexación ni activación procede; solo purga (ops delete idempotentes).
+CURTAIN_EDITORIAL: frozenset[str] = frozenset({"deleted", "withdrawn"})
+
+
 class IngestionWorker:
     """Worker asíncrono del outbox de indexación (specs/02 §27, §52)."""
 
@@ -52,6 +64,91 @@ class IngestionWorker:
         self._storage = storage
         self._destinations = {destination.name: destination for destination in destinations}
 
+    # -- cortina editorial (ADR-0004, Spec 06 §104) -----------------------------
+
+    async def _editorial_curtain(self, document_id: str) -> str | None:
+        """Devuelve el estado editorial bajo cortina del documento, o None.
+
+        Revalida contra PostgreSQL (fuente de verdad) en cada llamada: la
+        cortina puede aparecer en cualquier momento por moderación o borrado
+        concurrentes, por lo que una comprobación inicial aislada no basta.
+        """
+        document = await self._repo.get_document(document_id)
+        if document.editorial_status in CURTAIN_EDITORIAL:
+            return document.editorial_status
+        return None
+
+    async def _ensure_delete_ops(self, version_id: str) -> None:
+        """Garantiza ops `delete` persistidas para todos los destinos.
+
+        Idempotente: solo encola una op delete por destino si no existe ya
+        una (en cualquier estado) para ese par versión+destino. Así la purga
+        queda garantizada aunque la cortina se detecte varias veces.
+        """
+        existing = await self._repo.list_ops_for_version(version_id)
+        existing_deletes = {
+            op.destination
+            for op in existing
+            if op.operation == "delete"
+        }
+        for destination_name in self._destinations:
+            if destination_name in existing_deletes:
+                continue
+            await self._repo.enqueue_pending_op(
+                PendingIndexOp(
+                    op_id=_new_id("op"),
+                    version_id=version_id,
+                    destination=destination_name,
+                    operation="delete",
+                )
+            )
+
+    async def _curtain_version(self, version: DocumentVersion) -> DocumentVersion:
+        """Aplica la cortina a una versión: purga sí, indexación/activación no.
+
+        - Garantiza ops `delete` persistidas para todos los destinos (la
+          purga es eventual pero garantizada, ADR-0004).
+        - Ejecuta las ops `delete` pendientes/fallidas (idempotentes en los
+          destinos; no se marca done hasta que el destino confirma).
+        - Marca la versión `deleting` solo si la transición técnica lo
+          permite (indexing/available/failed -> deleting, ADR-0005); desde
+          queued/processing la versión queda congelada: el worker nunca la
+          indexa ni la activa, y la purga de sus chunks procede igualmente.
+        """
+        await self._ensure_delete_ops(version.version_id)
+        await self._run_delete_ops_only(version)
+        if version.status in {"indexing", "available", "failed"}:
+            try:
+                await self._repo.update_version_status(version.version_id, "deleting")
+            except Exception:
+                # La transición puede haber cambiado concurrentemente; la
+                # purga ya quedó garantizada con las ops delete.
+                pass
+        return await self._repo.get_version(version.version_id)
+
+    async def _run_delete_ops_only(self, version: DocumentVersion) -> None:
+        """Ejecuta SOLO las ops delete de la versión (idempotentes).
+
+        Las ops index/reconcile se ignoran bajo cortina (no se ejecutan ni
+        se completan: quedan para auditoría del outbox). Una op delete no
+        se marca done hasta que el destino confirma la eliminación; si
+        falla queda `failed` y `recover()` la reactiva (reintentable).
+        """
+        ops = await self._repo.list_ops_for_version(version.version_id)
+        for op in ops:
+            if op.status == "done" or op.operation != "delete":
+                continue
+            destination = self._destinations.get(op.destination)
+            if destination is None:
+                await self._repo.fail_pending_op(op.op_id, "ING_INDEX_FAILED")
+                continue
+            try:
+                await destination.remove_version(version.version_id)
+            except DestinationError:
+                await self._repo.fail_pending_op(op.op_id, "ING_INDEX_FAILED")
+                continue
+            await self._repo.complete_pending_op(op.op_id)
+
     # -- ciclo principal -------------------------------------------------------
 
     async def run_once(self, version_id: str) -> DocumentVersion:
@@ -59,8 +156,14 @@ class IngestionWorker:
 
         Idempotente: puede invocarse repetidamente (reintentos) sin duplicar
         chunks ni activar la versión antes de tiempo.
+
+        Cortina editorial: revalidada al inicio y antes de activar; si el
+        documento está `deleted`/`withdrawn`, la versión se purga en lugar
+        de indexarse (ADR-0004).
         """
         version = await self._repo.get_version(version_id)
+        if await self._editorial_curtain(version.document_id) is not None:
+            return await self._curtain_version(version)
         if version.status == "queued":
             version = await self._extract_and_persist_chunks(version)
         if version.status == "processing":
@@ -68,6 +171,10 @@ class IngestionWorker:
         if version.status == "indexing":
             version = await self._run_outbox_ops(version)
         if version.status == "indexing" and await self._activation_gate(version):
+            # Revalidar cortina antes de activar (cambio concurrente durante
+            # la indexación: moderación o borrado entre ops y compuerta).
+            if await self._editorial_curtain(version.document_id) is not None:
+                return await self._curtain_version(version)
             version = await self._activate(version)
         return version
 
@@ -78,15 +185,36 @@ class IngestionWorker:
           (reintentos seguros, specs/02 §29).
         - Reencola versiones `indexing` huérfanas (worker muerto a mitad de
           indexación) reactivando sus ops fallidas o pendientes.
+        - Cortina editorial: para documentos `deleted`/`withdrawn` NO
+          reactiva ops index/reconcile (incompatibles con la cortina);
+          solo reactiva ops `delete`, que siguen siendo recuperables
+          (la purga no se abandona, ADR-0004).
         """
         recovered: list[DocumentVersion] = []
         version_ids = await self._repo.list_version_ids_with_pending_ops()
         for version_id in version_ids:
+            version = await self._repo.get_version(version_id)
+            curtain = await self._editorial_curtain(version.document_id)
+            if curtain is not None:
+                # Bajo cortina: reactivar solo ops delete (purga garantizada).
+                await self._reset_failed_delete_ops(version_id)
+                version = await self._repo.get_version(version_id)
+                if version.status in {"indexing", "available", "failed"}:
+                    recovered.append(version)
+                continue
             await self._repo.reset_failed_ops(version_id)
             version = await self._repo.get_version(version_id)
             if version.status in {"queued", "processing", "indexing"}:
                 recovered.append(version)
         return recovered
+
+    async def _reset_failed_delete_ops(self, version_id: str) -> None:
+        """Reactiva SOLO las ops delete fallidas de la versión.
+
+        Las ops index/reconcile fallidas permanecen fallidas bajo cortina:
+        recover() no debe reintroducir contenido tras la cortina editorial.
+        """
+        await self._repo.reset_failed_delete_ops(version_id)
 
     # -- extracción y chunks -----------------------------------------------------
 
@@ -122,11 +250,24 @@ class IngestionWorker:
         Fallos parciales: si un destino falla, su op queda `failed` con el
         código y el contador de intentos; la otra puede completarse. La
         versión permanece `indexing` hasta que ambos confirmen.
+
+        Cortina editorial: revalidada antes de CADA op index/reconcile
+        (cubre moderación/borrado concurrentes durante el loop). Si la
+        cortina aparece a mitad del ciclo, las ops index/reconcile
+        restantes no se ejecutan: se garantizan y ejecutan solo las ops
+        delete (purga, ADR-0004).
         """
         ops = await self._repo.list_ops_for_version(version.version_id)
         for op in ops:
             if op.status == "done":
                 continue
+            # Revalidar cortina antes de cada op de indexación: la cortina
+            # puede aparecer durante el procesamiento (concurrencia).
+            if op.operation in {"index", "reconcile"}:
+                if await self._editorial_curtain(version.document_id) is not None:
+                    await self._ensure_delete_ops(version.version_id)
+                    await self._run_delete_ops_only(version)
+                    return version
             destination = self._destinations.get(op.destination)
             if destination is None:
                 await self._repo.fail_pending_op(op.op_id, "ING_INDEX_FAILED")
@@ -162,7 +303,14 @@ class IngestionWorker:
         return True
 
     async def _activate(self, version: DocumentVersion) -> DocumentVersion:
-        """Activa la versión y retira la anterior (specs/02 §48)."""
+        """Activa la versión y retira la anterior (specs/02 §48).
+
+        Defensa final: revalida la cortina justo antes de persistir la
+        activación (la compuerta ya la revalidó, pero la cortina puede
+        aparecer entre la compuerta y la activación por concurrencia).
+        """
+        if await self._editorial_curtain(version.document_id) is not None:
+            return await self._curtain_version(version)
         document = await self._repo.get_document(version.document_id)
         previous_version_id = document.active_version_id
         # 1. Activar la nueva versión (compuerta ya verificada).
