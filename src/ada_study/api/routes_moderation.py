@@ -106,13 +106,14 @@ async def moderation_queue(
 ):
     """Cola de revisión: documentos pendientes de decisión editorial.
 
-    - Requiere `moderation:review` (moderator/admin, Spec 06 §28).
+    - Requiere acceso de moderación: `permissions.can_moderate` →
+      moderator/admin (Spec 06 §28). student/trusted_contributor → 403.
     - Incluye `pending_review` (revisión previa) y `published_pending_review`
       (revisión posterior de trusted_contributor, Spec 06 §21-22).
     """
     from ada_study.domain import permissions
 
-    if not permissions.has_permission(user.role, "moderation:queue"):
+    if not permissions.can_moderate(user.role):
         raise ForbiddenError("moderation:queue")
 
     repository = request.app.state.ada.repository

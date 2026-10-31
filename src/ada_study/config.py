@@ -42,9 +42,11 @@ class Settings(BaseSettings):
     # Proveedor LLM del tutor (TASK-11). "none" (default) = modo determinístico
     # sin llamadas ni costos. La clave llega SOLO por entorno (.env); jamás se
     # incluye en código, logs ni mensajes de error (sin secretos en el repo).
-    ada_llm_provider: str = "none"  # "none" | "openai"
+    ada_llm_provider: str = "none"  # "none" | "openai" | "groq" (endpoint
+    # OpenAI-compatible de Groq; la factory fija base_url y reasoning_format)
     ada_llm_model: str = ""  # obligatorio si provider != "none" (p. ej. gpt-5.4-mini)
-    ada_llm_api_key: str = ""  # alternativa: OPENAI_API_KEY; sin default inseguro
+    ada_llm_api_key: str = ""  # alternativa: OPENAI_API_KEY (openai) o
+    # GROQ_API_KEY (groq); sin default inseguro
     # Límites por llamada (política de costos TASK-11: máx. 1 llamada del tutor
     # por intento; máx. 3 por petición con las 2 reparaciones del validator).
     ada_llm_temperature: float = 0.0

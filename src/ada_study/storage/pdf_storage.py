@@ -15,8 +15,12 @@ from pathlib import Path
 class PdfStorage:
     """Almacén de archivos content-addressed para PDF originales."""
 
-    def __init__(self, root: Path) -> None:
-        self._root = root
+    def __init__(self, root: Path | str) -> None:
+        # Normalización del contrato: `Settings.ada_storage_dir` es `str` (viene
+        # de una variable de entorno) y el almacén opera con rutas. `Path(str)`
+        # es idempotente, así que aceptar ambos aquí deja el contrato resuelto
+        # en un único lugar (sin conversiones dispersas en app/worker).
+        self._root = Path(root)
 
     @property
     def root(self) -> Path:

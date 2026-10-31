@@ -331,6 +331,34 @@ class TestModerationQueue:
             response = client.get("/api/moderation/queue", headers=_auth(token))
         assert response.status_code == 403
 
+    async def test_admin_sees_pending_queue(self):
+        """Admin accede a la cola igual que moderator (Spec 06 §28)."""
+        repo = FakeModerationRepository()
+        admin = _user("usr_adm_q", "admin")
+        repo.users[admin.user_id] = admin
+        repo.documents["doc_p"] = _document("doc_p", "usr_a", status="pending_review")
+        repo.documents["doc_post"] = _document(
+            "doc_post", "usr_b", status="published_pending_review"
+        )
+        repo.documents["doc_pub"] = _document(
+            "doc_pub", "usr_c", status="published"
+        )
+        token = _session_token(repo, admin)
+        with _client(repo) as client:
+            response = client.get("/api/moderation/queue", headers=_auth(token))
+        assert response.status_code == 200
+        ids = {d["document_id"] for d in response.json()["queue"]}
+        assert ids == {"doc_p", "doc_post"}
+
+    async def test_trusted_contributor_cannot_see_queue_403(self):
+        repo = FakeModerationRepository()
+        trusted = _user("usr_tr_q", "trusted_contributor")
+        repo.users[trusted.user_id] = trusted
+        token = _session_token(repo, trusted)
+        with _client(repo) as client:
+            response = client.get("/api/moderation/queue", headers=_auth(token))
+        assert response.status_code == 403
+
 
 # ---------------------------------------------------------------------------
 # Auditoría: lectura restringida y append-only

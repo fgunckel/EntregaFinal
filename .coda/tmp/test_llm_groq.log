@@ -1,0 +1,36 @@
+﻿============================= test session starts =============================
+platform win32 -- Python 3.12.10, pytest-8.4.2, pluggy-1.7.0 -- C:\Devs\CoderHouse\AI Engineer\Proyectos\ADA-Study\.venv\Scripts\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Devs\CoderHouse\AI Engineer\Proyectos\ADA-Study
+configfile: pyproject.toml
+plugins: anyio-4.15.1, langsmith-0.14.12, asyncio-1.4.0
+asyncio: mode=Mode.AUTO, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 25 items
+
+tests/test_study_llm.py::TestChatModelFactoryGroq::test_groq_without_key_fails_fast PASSED [  4%]
+tests/test_study_llm.py::TestChatModelFactoryGroq::test_groq_without_model_fails_fast PASSED [  8%]
+tests/test_study_llm.py::TestChatModelFactoryGroq::test_groq_model_with_ada_llm_api_key PASSED [ 12%]
+tests/test_study_llm.py::TestChatModelFactoryGroq::test_groq_key_fallback_to_groq_api_key_env PASSED [ 16%]
+tests/test_study_llm.py::TestChatModelFactoryGroq::test_groq_key_never_exposed PASSED [ 20%]
+tests/test_study_llm.py::TestChatModelFactoryGroq::test_groq_inherits_shared_limits PASSED [ 24%]
+tests/test_study_llm.py::TestChatModelFactory::test_default_settings_return_none PASSED [ 28%]
+tests/test_study_llm.py::TestChatModelFactory::test_openai_without_key_fails_fast PASSED [ 32%]
+tests/test_study_llm.py::TestChatModelFactory::test_openai_without_model_fails_fast PASSED [ 36%]
+tests/test_study_llm.py::TestChatModelFactory::test_unknown_provider_fails_fast PASSED [ 40%]
+tests/test_study_llm.py::TestChatModelFactory::test_openai_model_built_once_when_configured PASSED [ 44%]
+tests/test_study_llm.py::TestTutorWithFakeModel::test_llm_explanation_with_valid_output PASSED [ 48%]
+tests/test_study_llm.py::TestTutorWithFakeModel::test_provider_error_falls_back_deterministically PASSED [ 52%]
+tests/test_study_llm.py::TestTutorWithFakeModel::test_timeout_falls_back_deterministically PASSED [ 56%]
+tests/test_study_llm.py::TestTutorWithFakeModel::test_empty_output_falls_back PASSED [ 60%]
+tests/test_study_llm.py::TestTutorWithFakeModel::test_oversized_output_falls_back PASSED [ 64%]
+tests/test_study_llm.py::TestTutorWithFakeModel::test_insufficient_evidence_never_calls_llm PASSED [ 68%]
+tests/test_study_llm.py::TestTutorWithFakeModel::test_deterministic_mode_without_chat_model PASSED [ 72%]
+tests/test_study_llm.py::TestReferencesAndInjection::test_references_come_from_retrieval_only PASSED [ 76%]
+tests/test_study_llm.py::TestReferencesAndInjection::test_prompt_is_delimited_and_escaped PASSED [ 80%]
+tests/test_study_llm.py::TestReferencesAndInjection::test_injected_output_cannot_alter_contract PASSED [ 84%]
+tests/test_study_llm.py::TestEndpointWiring::test_endpoint_uses_injected_chat_model PASSED [ 88%]
+tests/test_study_llm.py::TestEndpointWiring::test_endpoint_without_chat_model_stays_deterministic PASSED [ 92%]
+tests/test_study_llm.py::test_request_limit_constant_unchanged PASSED    [ 96%]
+tests/test_study_llm.py::test_compile_graph_accepts_tutor_model_without_supervisor_change PASSED [100%]
+
+============================= 25 passed in 5.83s ==============================

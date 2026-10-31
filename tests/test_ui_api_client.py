@@ -147,6 +147,32 @@ class TestUiClientFlows:
             updated = client.decide("doc_p", "approve")
         assert updated["editorial_status"] == "published"
 
+    def test_admin_parses_moderation_queue_200(self):
+        """Flujo 200 real: el cliente UI parsea la cola (`{"queue": [...]}`).
+
+        Cubre admin accediendo a la cola (fix de `can_moderate`) y el
+        parseo de la clave `queue` del payload (regresión del crash de
+        Streamlit por clave `documents` inexistente).
+        """
+        repo = FakeCatalogRepository()
+        admin = _user("usr_adm_ui", "admin")
+        repo.users[admin.user_id] = admin
+        repo.documents["doc_p"] = _document("doc_p", "autor", status="pending_review")
+        repo.documents["doc_post"] = _document(
+            "doc_post", "otro", status="published_pending_review"
+        )
+        repo.documents["doc_pub"] = _document("doc_pub", "otro", status="published")
+        token = _session_token(repo, admin)
+        with TestClient(_build_app(repo)) as http:
+            client = ApiClient("http://testserver", token, http=http)
+            queue = client.moderation_queue()
+        assert [d.document_id for d in queue] == ["doc_p", "doc_post"]
+        assert all(
+            d.editorial_status in ("pending_review", "published_pending_review")
+            for d in queue
+        )
+        assert all(isinstance(d, DocumentRecord) for d in queue)
+
 
 # ---------------------------------------------------------------------------
 # Helpers

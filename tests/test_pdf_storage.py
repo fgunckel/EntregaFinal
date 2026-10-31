@@ -83,3 +83,34 @@ class TestDelete:
         assert storage.exists(key) is True
         missing_sha = "ff" + "0" * 62
         assert storage.exists(f"{missing_sha[:2]}/{missing_sha}.pdf") is False
+
+
+class TestConstructorContract:
+    """El constructor normaliza la raíz a Path (FIX-1).
+
+    `Settings.ada_storage_dir` es `str` (variable de entorno): app.py y
+    worker_cli.py instancian `PdfStorage` con esa cadena directamente.
+    """
+
+    def test_accepts_str_root_and_operates(self, tmp_path: Path):
+        root = str(tmp_path / "storage_str")
+        storage = PdfStorage(root=root)
+        assert storage.root == tmp_path / "storage_str"
+        sha, key = storage.save_pdf(PDF_A)
+        assert (storage.root / key).exists()
+        assert storage.open_pdf(key) == PDF_A
+
+    def test_accepts_path_root_and_operates(self, tmp_path: Path):
+        root = tmp_path / "storage_path"
+        storage = PdfStorage(root=root)
+        assert storage.root == root
+        sha, key = storage.save_pdf(PDF_A)
+        assert (storage.root / key).exists()
+        assert storage.open_pdf(key) == PDF_A
+
+    def test_str_and_path_roots_are_equivalent(self, tmp_path: Path):
+        from_str = PdfStorage(root=str(tmp_path / "equiv"))
+        from_path = PdfStorage(root=tmp_path / "equiv")
+        sha_a, key_a = from_str.save_pdf(PDF_A)
+        sha_b, key_b = from_path.save_pdf(PDF_A)
+        assert (sha_a, key_a) == (sha_b, key_b)

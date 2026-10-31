@@ -1,7 +1,7 @@
 # ADR-0001 — Catálogo y versiones de documentos en PostgreSQL
 
-- Estado: Propuesto (espera aprobación del usuario). Alineado con `specs/ADR-001` (aprobada) y `specs/06`.
-- Fecha: 2026-10-25 (rev. 2 — integración Spec Kit v6)
+- Estado: Aceptado (rev. 3 aprobada por el usuario el 2026-10-30). Alineado con `specs/ADR-001` (aprobada) y `specs/06`.
+- Fecha: 2026-10-30 (rev. 3 — claim de huella en `documents`)
 - Decisión aprobada previamente: PostgreSQL como fuente de verdad del catálogo y del historial de versiones.
 
 ## Contexto
@@ -36,6 +36,7 @@ documents (
   review_status     TEXT NOT NULL DEFAULT 'not_required',
       -- not_required|pending|approved|rejected|needs_changes
   uploaded_by       UUID NULL,                -- FK a usuarios (Spec 06); NULL hasta existir identidad
+  sha256            CHAR(64) NULL,            -- claim de huella (rev. 3, ver "Deduplicación")
   created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
   deleted_at        TIMESTAMPTZ NULL          -- borrado lógico (Spec 01)
@@ -77,10 +78,77 @@ pending_index_ops (
 --   chunk_index, content_hash, text, title, source) — fuente de verdad de fragmentos.
 ```
 
-### Deduplicación (Spec 02 §17)
+### Deduplicación (Spec 02 §17) — rev. 3: claim en `documents`
 
-- **Mismo documento:** una carga cuyo SHA-256 coincide con una versión ya registrada de ese documento **no crea duplicados**: respuesta explícita con el documento/versión existente.
-- **Entre documentos distintos:** la política (rechazar con 409, o crear referencia/compartir contenido) **queda como propuesta pendiente de aprobación**; no se asume silenciosamente. La rev. 1 proponía índice único global; se mantiene como propuesta, no como decisión.
+**Limitación de PostgreSQL que motivó el cambio:** la rev. 2 colocaba la
+unicidad de huella en `document_versions` con un índice parcial cuyo
+predicado contenía una subconsulta
+(`document_id IN (SELECT document_id FROM documents WHERE deleted_at IS NULL)`).
+PostgreSQL **no soporta subconsultas en predicados de índice**
+(`cannot use subquery in index predicate`): ese DDL hace fallar
+`metadata.create_all` y no puede existir en la base.
+
+**Decisión (rev. 3):** el claim se **desnormaliza** a `documents.sha256` y la
+unicidad se garantiza con un índice único parcial a nivel DOCUMENTO:
+
+```sql
+CREATE UNIQUE INDEX ux_documents_active_sha256
+    ON documents (sha256) WHERE deleted_at IS NULL;
+```
+
+- **Justificación de la desnormalización:** la huella se reclama a nivel
+  documento lógico; un índice parcial sobre `document_versions` no puede
+  referenciar `documents` (limitación anterior) y además era semánticamente
+  incorrecto: el claim existe **desde el registro de la versión**, no desde
+  su activación (una versión `queued`/`failed` ya ocupa la huella), y las
+  versiones históricas de un mismo documento comparten huella
+  legítimamente (restauración). Duplicar la huella en `documents` es el
+  único punto donde "un documento vivo" es una sola fila indexable.
+- **Ciclo de vida del claim** (`documents.sha256`):
+  - Nace en el **registro** del documento, en la MISMA transacción que el
+    INSERT de la versión inicial, el job y las ops del outbox
+    (`create_document_atomic`).
+  - Se **traslada** a la huella de cada versión nueva en la MISMA
+    transacción que su alta (restauración: `create_version_with_claim`).
+  - Lo **retienen** los estados editoriales intermedios
+    (`pending_review`, `withdrawn`, `published*`, `rejected`) y los estados
+    técnicos de la versión (`queued`, `failed`): el dedup no depende del
+    progreso de ingesta ni de la moderación.
+  - Lo **libera** solo el borrado (`deleted_at` NOT NULL → la fila sale del
+    índice parcial); `deleted` es terminal, no hay restauración del claim.
+- **Flujo de detección (invariante):** el dedup se resuelve al **registrar**
+  la versión (pre-check de servicio para mensaje amable + garantía del
+  índice único en la misma transacción del repositorio). El worker NO
+  resuelve deduplicación: solo mapea fallos a `ING_DUPLICATE` cuando los hay.
+- **Concurrencia:** el índice único parcial es la garantía final; el
+  repositorio traduce a `DuplicateDocumentError` (409 `ING_DUPLICATE`)
+  **únicamente** las violaciones cuyo constraint sea
+  `ux_documents_active_sha256`; cualquier otra `IntegrityError` se propaga
+  sin traducir (p. ej. `ux_versions_document_number`).
+- **Contratos:** `DocumentRecord` NO expone `sha256` (el claim es un
+  detalle del repositorio, se pasa como parámetro); el `status` HTTP de
+  `ING_DUPLICATE` (409) no cambia y ahora también aplica al endpoint de
+  restore.
+
+### Migración (rev. 3, idempotente y no destructiva)
+
+`metadata.create_all` NO modifica tablas existentes. La migración vive en
+`src/ada_study/db/migrations.py` (CLI: `python -m ada_study.db.migrate
+<DATABASE_URL>`; `create_schema` la ejecuta como verificación final):
+
+1. `ALTER TABLE documents ADD COLUMN sha256` si falta (nullable: seguro en
+   bases pobladas).
+2. Backfill del claim: huella de la versión registrada más reciente NO
+   purgada (`status <> 'deleting'`) de cada documento que aún no tenga claim.
+3. **Detección de conflictos**: si dos o más documentos vivos reclaman la
+   misma huella, aborta SIN crear el índice y SIN modificar datos
+   (`MigrationConflictError`); el conflicto se resuelve por vía editorial.
+4. `CREATE UNIQUE INDEX ux_documents_active_sha256 ... WHERE deleted_at IS NULL`.
+5. `DROP INDEX ux_versions_active_sha256` (nunca pudo existir en PostgreSQL:
+   predicado con subconsulta).
+
+Cada paso es idempotente (`IF NOT EXISTS`/verificación previa); ejecutar la
+migración N veces converge al mismo esquema sin pérdida de datos.
 
 ## Restauración (Spec 06 §74, Spec 02 §49)
 
@@ -98,5 +166,6 @@ pending_index_ops (
 
 ## Historial de revisión
 
+- **Rev. 3 (2026-10-30):** deduplicación aprobada y corregida. Cambios: el claim de huella se traslada de `document_versions` a `documents.sha256` (desnormalización); índice único parcial `ux_documents_active_sha256 WHERE deleted_at IS NULL` reemplaza a `ux_versions_active_sha256` (inválido: PostgreSQL no soporta subconsultas en predicados de índice); el claim nace en el registro y se traslada en la misma transacción de cada alta de versión (registro y restauración atómicas: documento/claim + versión + job + outbox en una sola transacción); `deleted_at` libera el claim; ciclo de vida documentado; migración idempotente no destructiva (`db/migrations.py`) con backfill y detección de conflictos previa a la creación del índice.
 - **Rev. 2 (2026-10-25):** integración Spec Kit v6. Cambios: modelo de dos ciclos de estado (editorial en `documents`, técnico en versiones); `active_version_id`, `subject`, `uploaded_by`, `deleted_at` en `documents`; `storage_key`, `content_type`, `error_code` en versiones; tabla `pending_index_ops` (outbox por destino); dedup entre documentos distintos pasa de "índice único global" a "política pendiente de aprobación"; restauración alineada con Spec 06 (inmutabilidad, reconciliación); se agrega responsabilidad de identidad/moderación/auditoría (Spec 06).
 - **Rev. 1 (2026-10-25):** versión inicial de TASK-01.

@@ -7,10 +7,14 @@ determinístico y los demás nodos no usan LLM).
 Política de configuración:
 - `ada_llm_provider="none"` (default seguro) devuelve None: el sistema corre
   en modo determinístico sin dependencias de proveedor ni costos.
-- `provider="openai"`: importa `langchain_openai` de forma perezosa (extra
-  opcional `llm` de pyproject). La configuración se valida ANTES de importar:
-  falta de clave o modelo es un error de configuración (fail-fast al arrancar
-  en `create_app`), nunca un ImportError a mitad de una petición.
+- `provider="openai"` o `provider="groq"`: importa `langchain_openai` de forma
+  perezosa (extra opcional `llm` de pyproject). La configuración se valida
+  ANTES de importar: falta de clave o modelo es un error de configuración
+  (fail-fast al arrancar en `create_app`), nunca un ImportError a mitad de
+  una petición. Groq se sirve con el MISMO cliente `ChatOpenAI` apuntando al
+  endpoint oficial OpenAI-compatible (`GROQ_BASE_URL`), sin dependencias
+  nuevas; `reasoning_format=parsed` evita que los modelos gpt-oss mezclen
+  su cadena de análisis dentro del contenido de la respuesta.
 - La clave API nunca se registra en logs ni se incluye en mensajes de error.
 
 Política de límites (costos y latencia): `temperature`, `max_tokens`,
@@ -25,7 +29,16 @@ from ada_study.config import Settings
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_PROVIDERS = {"openai"}
+SUPPORTED_PROVIDERS = {"openai", "groq"}
+
+# Endpoint oficial OpenAI-compatible de Groq (console.groq.com/docs/openai):
+# mismo protocolo de chat completions, autenticación Bearer con la clave.
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+
+# gpt-oss es un modelo de razonamiento: el formato default de Groq ("raw")
+# devuelve la cadena de análisis dentro de `content`. "parsed" la separa en
+# un campo propio para que el tutor reciba SOLO el texto de la explicación.
+GROQ_REASONING_FORMAT = "parsed"
 
 # Limitación declarada en StudyResponse.limitations cuando el proveedor falla
 # y el tutor recurre a la composición determinística (política de fallback
@@ -48,7 +61,13 @@ def build_chat_model(settings: Settings):
     """Construye el chat model del tutor o None en modo determinístico.
 
     - None: modo determinístico (`provider="none"`, default).
-    - `BaseChatModel` de OpenAI si `provider="openai"` con modelo y clave.
+    - `BaseChatModel` de OpenAI si `provider="openai"` con modelo y clave
+      (`ADA_LLM_API_KEY` u `OPENAI_API_KEY`).
+    - `BaseChatModel` de Groq si `provider="groq"` con modelo y clave
+      (`ADA_LLM_API_KEY` o `GROQ_API_KEY`): mismo `ChatOpenAI` contra el
+      endpoint OpenAI-compatible de Groq, con `reasoning_format=parsed`
+      (los modelos gpt-oss razonan; sin esto el análisis contaminaría
+      `content` y, con él, la explicación del tutor).
     - `LLMConfigError` ante configuración inválida o extra no instalado; el
       mensaje nunca contiene la clave ni valores sensibles.
     """
@@ -64,15 +83,24 @@ def build_chat_model(settings: Settings):
 
     model = (settings.ada_llm_model or "").strip()
     if not model:
-        raise LLMConfigError("ADA_LLM_PROVIDER=openai requiere ADA_LLM_MODEL.")
+        raise LLMConfigError(f"ADA_LLM_PROVIDER={provider} requiere ADA_LLM_MODEL.")
 
-    api_key = (settings.ada_llm_api_key or "").strip() or os.environ.get(
-        "OPENAI_API_KEY", ""
-    ).strip()
-    if not api_key:
-        raise LLMConfigError(
-            "ADA_LLM_PROVIDER=openai requiere ADA_LLM_API_KEY u OPENAI_API_KEY."
-        )
+    if provider == "groq":
+        api_key = (settings.ada_llm_api_key or "").strip() or os.environ.get(
+            "GROQ_API_KEY", ""
+        ).strip()
+        if not api_key:
+            raise LLMConfigError(
+                "ADA_LLM_PROVIDER=groq requiere ADA_LLM_API_KEY o GROQ_API_KEY."
+            )
+    else:
+        api_key = (settings.ada_llm_api_key or "").strip() or os.environ.get(
+            "OPENAI_API_KEY", ""
+        ).strip()
+        if not api_key:
+            raise LLMConfigError(
+                "ADA_LLM_PROVIDER=openai requiere ADA_LLM_API_KEY u OPENAI_API_KEY."
+            )
 
     try:
         from langchain_openai import ChatOpenAI  # import perezoso (extra `llm`)
@@ -84,14 +112,16 @@ def build_chat_model(settings: Settings):
 
     # Registro sin secretos: solo parámetros operativos (TASK-11).
     logger.info(
-        "Chat model del tutor configurado: model=%s max_tokens=%s "
-        "timeout=%ss max_retries=%s (clave no registrada).",
+        "Chat model del tutor configurado: provider=%s model=%s base_url=%s "
+        "max_tokens=%s timeout=%ss max_retries=%s (clave no registrada).",
+        provider,
         model,
+        GROQ_BASE_URL if provider == "groq" else "default",
         settings.ada_llm_max_tokens,
         settings.ada_llm_timeout_seconds,
         settings.ada_llm_max_retries,
     )
-    return ChatOpenAI(
+    client_kwargs: dict = dict(
         model=model,
         api_key=api_key,
         temperature=settings.ada_llm_temperature,
@@ -99,3 +129,7 @@ def build_chat_model(settings: Settings):
         timeout=settings.ada_llm_timeout_seconds,
         max_retries=settings.ada_llm_max_retries,
     )
+    if provider == "groq":
+        client_kwargs["base_url"] = GROQ_BASE_URL
+        client_kwargs["extra_body"] = {"reasoning_format": GROQ_REASONING_FORMAT}
+    return ChatOpenAI(**client_kwargs)

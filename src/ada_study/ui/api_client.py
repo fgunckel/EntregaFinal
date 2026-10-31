@@ -210,7 +210,7 @@ class ApiClient:
     def moderation_queue(self) -> list[DocumentRecord]:
         """GET /api/moderation/queue: pendientes de decisión (moderator/admin)."""
         payload = self._parse_json(self._call("GET", "/api/moderation/queue"))
-        return [DocumentRecord.model_validate(item) for item in payload["documents"]]
+        return [DocumentRecord.model_validate(item) for item in payload["queue"]]
 
     def decide(self, document_id: str, action: str, reason: str | None = None) -> dict:
         """POST /api/moderation/documents/{id}/decide.

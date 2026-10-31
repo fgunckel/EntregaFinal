@@ -84,6 +84,85 @@ def _client_with_model(repo: FakeStudyRepository, chat_model) -> TestClient:
 # ---------------------------------------------------------------------------
 
 
+class TestChatModelFactoryGroq:
+    """Proveedor Groq: endpoint OpenAI-compatible vía el mismo ChatOpenAI.
+
+    Sin llamadas reales: la construcción de `ChatOpenAI` no contacta al
+    proveedor; solo se verifican base URL, modelo, `reasoning_format` y
+    resolución de clave (sin secretos expuestos).
+    """
+
+    _BASE_URL = "https://api.groq.com/openai/v1"
+    _MODEL = "openai/gpt-oss-120b"
+    _GROQ_KEY = "gsk-test-dummy-key-not-real"
+
+    def _settings(self, **overrides) -> Settings:
+        values = dict(
+            database_url="postgresql+asyncpg://fake",
+            ada_llm_provider="groq",
+            ada_llm_model=self._MODEL,
+            ada_llm_api_key=self._GROQ_KEY,
+        )
+        values.update(overrides)
+        return Settings(**values)
+
+    def test_groq_without_key_fails_fast(self, monkeypatch):
+        monkeypatch.delenv("GROQ_API_KEY", raising=False)
+        monkeypatch.delenv("ADA_LLM_API_KEY", raising=False)
+        settings = self._settings(ada_llm_api_key="")
+        with pytest.raises(LLMConfigError):
+            build_chat_model(settings)
+
+    def test_groq_without_model_fails_fast(self, monkeypatch):
+        monkeypatch.delenv("GROQ_API_KEY", raising=False)
+        with pytest.raises(LLMConfigError):
+            build_chat_model(self._settings(ada_llm_model=""))
+
+    def test_groq_model_with_ada_llm_api_key(self, monkeypatch):
+        monkeypatch.delenv("GROQ_API_KEY", raising=False)
+        pytest.importorskip("langchain_openai")
+        model = build_chat_model(self._settings())
+        assert model is not None
+        assert model.model_name == self._MODEL
+        assert model.openai_api_base == self._BASE_URL
+        assert model.extra_body == {"reasoning_format": "parsed"}
+
+    def test_groq_key_fallback_to_groq_api_key_env(self, monkeypatch):
+        monkeypatch.delenv("ADA_LLM_API_KEY", raising=False)
+        monkeypatch.setenv("GROQ_API_KEY", self._GROQ_KEY)
+        pytest.importorskip("langchain_openai")
+        model = build_chat_model(self._settings(ada_llm_api_key=""))
+        assert model is not None
+        assert model.openai_api_base == self._BASE_URL
+        assert model.model_name == self._MODEL
+
+    def test_groq_key_never_exposed(self, monkeypatch):
+        """La clave no aparece en la representación del modelo ni en errores."""
+        monkeypatch.delenv("GROQ_API_KEY", raising=False)
+        pytest.importorskip("langchain_openai")
+        model = build_chat_model(self._settings())
+        assert self._GROQ_KEY not in repr(model)
+        assert self._GROQ_KEY not in str(model)
+        with pytest.raises(LLMConfigError) as exc_info:
+            build_chat_model(self._settings(ada_llm_model=""))
+        assert self._GROQ_KEY not in str(exc_info.value)
+
+    def test_groq_inherits_shared_limits(self, monkeypatch):
+        """temperature/max_tokens/timeout/max_retries de Settings se aplican igual."""
+        pytest.importorskip("langchain_openai")
+        model = build_chat_model(
+            self._settings(
+                ada_llm_temperature=0.0,
+                ada_llm_max_tokens=900,
+                ada_llm_timeout_seconds=15,
+                ada_llm_max_retries=1,
+            )
+        )
+        assert model.temperature == 0.0
+        assert model.max_tokens == 900
+        assert model.max_retries == 1
+
+
 class TestChatModelFactory:
     def test_default_settings_return_none(self):
         """Modo determinístico sin credenciales: provider 'none' → None."""

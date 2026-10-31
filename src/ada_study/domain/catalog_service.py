@@ -60,7 +60,12 @@ class CatalogService:
           layout y la verificación de `open_pdf`).
         - Dedup: si la huella ya está registrada en un documento lógico
           distinto, lanza DuplicateDocumentError (409 ING_DUPLICATE) sin
-          fusionar autoría, permisos ni historial.
+          fusionar autoría, permisos ni historial. La garantía final es el
+          índice único `ux_documents_active_sha256` (atómico ante carreras);
+          el pre-check solo mejora el mensaje.
+        - ATÓMICO (ADR-0001 rev. 3): documento con claim de huella + versión
+          + job + outbox en UNA transacción del repositorio; un fallo en
+          cualquier paso no deja residuos.
         - La versión nace `queued`: no es recuperable hasta completar la
           ingesta (criterio de aceptación de TASK-02).
         - Estado editorial inicial (Spec 06 §51): student nace
@@ -111,20 +116,20 @@ class CatalogService:
             updated_at=now,
             error_code=None,
         )
-        await self._repo.create_document(document)
-        await self._repo.create_version(version)
-        await self._repo.create_job(job)
-        # Outbox: indexación pendiente por destino (ADR-0001/0004). El worker
-        # de TASK-03 las ejecutará; hasta entonces la versión no es available.
-        for destination in ("pinecone", "bm25"):
-            await self._repo.enqueue_pending_op(
-                PendingIndexOp(
-                    op_id=_new_id("op"),
-                    version_id=version.version_id,
-                    destination=destination,
-                    operation="index",
-                )
+        ops = [
+            PendingIndexOp(
+                op_id=_new_id("op"),
+                version_id=version.version_id,
+                destination=destination,
+                operation="index",
             )
+            for destination in ("pinecone", "bm25")
+        ]
+        # Una única transacción: documento con claim de huella + versión +
+        # job + outbox (ADR-0001 rev. 3). Un fallo revierte TODO.
+        await self._repo.create_document_atomic(
+            document, sha256=sha256, version=version, job=job, ops=ops
+        )
         return document, version, job
 
     async def restore_version(
@@ -137,6 +142,11 @@ class CatalogService:
         - La nueva versión obtiene el siguiente version_number, hereda la huella
           y la storage_key (mismo contenido físico), y nace `queued`: debe pasar
           de nuevo por ingesta/indexación antes de activarse.
+        - Dedup (ADR-0001 rev. 3): si OTRO documento vivo reclama la huella
+          histórica, lanza DuplicateDocumentError (409 ING_DUPLICATE). El
+          traslado del claim y el alta de la versión son ATÓMICOS (una única
+          transacción con job y outbox): un conflicto no deja versión, job ni
+          ops parciales.
         - La activación (active_version_id) queda para el worker de TASK-03,
           cuando la nueva versión esté `available`.
         """
@@ -146,6 +156,13 @@ class CatalogService:
             from ada_study.db.repository import NotFoundError
 
             raise NotFoundError("Versión", historical_version_id)
+        # Pre-check de dedup (ADR-0001 rev. 3): la huella histórica puede
+        # estar reclamada por otro documento vivo (p. ej. alguien cargó un
+        # PDF idéntico después de que esta versión quedara purgada). La
+        # garantía final es el índice único dentro de la transacción.
+        claimant = await self._repo.find_active_version_by_sha256(historical.sha256)
+        if claimant is not None and claimant.document_id != document_id:
+            raise DuplicateDocumentError(claimant.document_id, claimant.version_id)
         history = await self._repo.list_versions(document_id)
         next_number = max(v.version_number for v in history) + 1
         now = _now_iso()
@@ -162,7 +179,6 @@ class CatalogService:
             page_count=None,
             error_code=None,
         )
-        await self._repo.create_version(restored)
         job = IngestionJob(
             job_id=_new_id("job"),
             document_id=document_id,
@@ -172,16 +188,24 @@ class CatalogService:
             updated_at=now,
             error_code=None,
         )
-        await self._repo.create_job(job)
-        for destination in ("pinecone", "bm25"):
-            await self._repo.enqueue_pending_op(
-                PendingIndexOp(
-                    op_id=_new_id("op"),
-                    version_id=restored.version_id,
-                    destination=destination,
-                    operation="index",
-                )
+        ops = [
+            PendingIndexOp(
+                op_id=_new_id("op"),
+                version_id=restored.version_id,
+                destination=destination,
+                operation="index",
             )
+            for destination in ("pinecone", "bm25")
+        ]
+        # Restauración atómica (ADR-0001 rev. 3): claim + versión + job +
+        # outbox en UNA transacción. Si otro documento vivo reclama la huella,
+        # PostgreSQL revierte TODO y el repo lanza DuplicateDocumentError.
+        await self._repo.create_version_with_claim(
+            restored,
+            claim_sha256=historical.sha256,
+            job=job,
+            ops=ops,
+        )
         return restored
 
     async def delete_document(self, document_id: str) -> DocumentRecord:

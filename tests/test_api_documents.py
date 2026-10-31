@@ -14,6 +14,7 @@ integración con PostgreSQL real están en test_catalog_integration.py.
 """
 
 import tempfile
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -29,6 +30,7 @@ from ada_study.contracts.documents import (
 )
 from ada_study.contracts.identity import SessionRecord, UserRecord
 from ada_study.db.repository import (
+    DuplicateDocumentError,
     NotFoundError,
 )
 from ada_study.storage.pdf_storage import PdfStorage
@@ -83,24 +85,165 @@ class FakeApiRepository:
         self.chunks: dict[str, list] = {}
         self.users: dict[str, UserRecord] = {}
         self.sessions: dict[str, SessionRecord] = {}
+        # Claim de dedup (`documents.sha256`): huella -> documento vivo dueño.
+        self.document_claims: dict[str, str] = {}
+        # Inyección de fallos para probar el rollback atómico.
+        self.fail_next_atomic: Exception | None = None
+
+    # -- transacción y claim de huella (ADR-0001 rev. 3) ---------------------
+
+    def _fail_midway(self) -> None:
+        """Inyecta un fallo a mitad de transacción (si hay uno encolado)."""
+        if self.fail_next_atomic is not None:
+            failure, self.fail_next_atomic = self.fail_next_atomic, None
+            raise failure
+
+    def _apply_atomically(
+        self, steps: list[tuple[Callable[[], None], Callable[[], None]]]
+    ) -> None:
+        """Aplica pares (hacer, deshacer) en orden o revierte lo ya aplicado."""
+        applied: list[Callable[[], None]] = []
+        try:
+            for apply_step, undo_step in steps:
+                apply_step()
+                applied.append(undo_step)
+        except BaseException:
+            for undo_step in reversed(applied):
+                undo_step()
+            raise
+
+    def _latest_claimant_version(
+        self, sha256: str, document_id: str
+    ) -> DocumentVersion | None:
+        candidates = [
+            v
+            for v in self.versions.values()
+            if v.document_id == document_id
+            and v.sha256 == sha256
+            and v.status != "deleting"
+        ]
+        return max(candidates, key=lambda v: v.version_number) if candidates else None
+
+    def _assert_claimable(self, sha256: str, claimant_id: str) -> None:
+        """Índice único `ux_documents_active_sha256` simulado (409)."""
+        current = self.document_claims.get(sha256)
+        if current is None or current == claimant_id:
+            return
+        existing = self._latest_claimant_version(sha256, current)
+        if existing is not None:
+            raise DuplicateDocumentError(current, existing.version_id)
+
+    def _move_claim(self, document_id: str, claim_sha256: str) -> None:
+        """Traslada el claim vivo del documento hacia la huella reclamada."""
+        for sha, owner in list(self.document_claims.items()):
+            if owner == document_id and sha != claim_sha256:
+                del self.document_claims[sha]
+        self.document_claims[claim_sha256] = document_id
+
+    def _restore_claims(self, snapshot: dict[str, str]) -> None:
+        self.document_claims.clear()
+        self.document_claims.update(snapshot)
 
     # -- catálogo (contrato completo usado por API + worker) ----------------
 
     async def find_active_version_by_sha256(self, sha256: str) -> DocumentVersion | None:
-        active_docs = {
-            d.document_id for d in self.documents.values() if d.deleted_at is None
-        }
-        for version in self.versions.values():
-            if (
-                version.sha256 == sha256
-                and version.document_id in active_docs
-                and version.status != "deleting"
-            ):
-                return version
-        return None
+        claimant_id = self.document_claims.get(sha256)
+        if claimant_id is None:
+            return None
+        claimant = self.documents.get(claimant_id)
+        if claimant is None or claimant.deleted_at is not None:
+            return None  # el borrado libera la huella (índice parcial)
+        return self._latest_claimant_version(sha256, claimant_id)
 
-    async def create_document(self, record: DocumentRecord) -> None:
+    async def create_document(self, record: DocumentRecord, *, sha256: str) -> None:
+        """Inserta el documento con su claim de huella; falla si ya existe."""
+        self._assert_claimable(sha256, record.document_id)
         self.documents[record.document_id] = record
+        self.document_claims[sha256] = record.document_id
+
+    async def create_document_atomic(
+        self,
+        record: DocumentRecord,
+        *,
+        sha256: str,
+        version: DocumentVersion,
+        job: IngestionJob,
+        ops: list[PendingIndexOp],
+    ) -> None:
+        """Registro ATÓMICO: documento + claim + versión + job + outbox.
+
+        Un fallo en cualquier paso revierte todo: sin documento, claim,
+        versión, job ni ops (sin registros parciales, ADR-0001 rev. 3).
+        """
+        self._assert_claimable(sha256, record.document_id)
+        self._apply_atomically(
+            [
+                (
+                    lambda: self.documents.__setitem__(record.document_id, record),
+                    lambda: self.documents.pop(record.document_id, None),
+                ),
+                (
+                    lambda: self.document_claims.__setitem__(sha256, record.document_id),
+                    lambda: self.document_claims.pop(sha256, None),
+                ),
+                (self._fail_midway, lambda: None),
+                (
+                    lambda: self.versions.__setitem__(version.version_id, version),
+                    lambda: self.versions.pop(version.version_id, None),
+                ),
+                (
+                    lambda: self.jobs.__setitem__(job.job_id, job),
+                    lambda: self.jobs.pop(job.job_id, None),
+                ),
+                *[
+                    (
+                        lambda op=op: self.pending_ops.__setitem__(op.op_id, op),
+                        lambda op_id=op.op_id: self.pending_ops.pop(op_id, None),
+                    )
+                    for op in ops
+                ],
+            ]
+        )
+
+    async def create_version_with_claim(
+        self,
+        version: DocumentVersion,
+        *,
+        claim_sha256: str,
+        job: IngestionJob,
+        ops: list[PendingIndexOp],
+    ) -> DocumentVersion:
+        """Nueva versión + traslado del claim, en UNA transacción (rev. 3)."""
+        document = self.documents.get(version.document_id)
+        if document is None or document.deleted_at is not None:
+            raise NotFoundError("Documento", version.document_id)
+        self._assert_claimable(claim_sha256, version.document_id)
+        claims_snapshot = dict(self.document_claims)
+        self._apply_atomically(
+            [
+                (
+                    lambda: self._move_claim(version.document_id, claim_sha256),
+                    lambda: self._restore_claims(claims_snapshot),
+                ),
+                (self._fail_midway, lambda: None),
+                (
+                    lambda: self.versions.__setitem__(version.version_id, version),
+                    lambda: self.versions.pop(version.version_id, None),
+                ),
+                (
+                    lambda: self.jobs.__setitem__(job.job_id, job),
+                    lambda: self.jobs.pop(job.job_id, None),
+                ),
+                *[
+                    (
+                        lambda op=op: self.pending_ops.__setitem__(op.op_id, op),
+                        lambda op_id=op.op_id: self.pending_ops.pop(op_id, None),
+                    )
+                    for op in ops
+                ],
+            ]
+        )
+        return version
 
     async def create_version(self, version: DocumentVersion) -> None:
         self.versions[version.version_id] = version

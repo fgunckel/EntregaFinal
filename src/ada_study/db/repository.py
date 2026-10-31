@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
 from sqlalchemy import delete, insert, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from ada_study.contracts.documents import (
@@ -51,8 +52,11 @@ class CatalogError(Exception):
 class DuplicateDocumentError(CatalogError):
     """Huella SHA-256 ya registrada en otro documento lógico (409 ING_DUPLICATE)."""
 
-    def __init__(self, document_id: str, version_id: str) -> None:
+    def __init__(self, document_id: str, version_id: str | None) -> None:
         self.existing_document_id = document_id
+        # `None` cuando el reclamante existe (claim en `documents.sha256`) pero
+        # no tiene una versión recuperable con esa huella (p. ej. base legada
+        # con claims cruzados tras una migración).
         self.existing_version_id = version_id
         super().__init__(
             "ING_DUPLICATE",
@@ -87,6 +91,28 @@ class InvitationAlreadyConsumedError(CatalogError):
 
 def _iso(value: datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
+
+
+# Índice único parcial de deduplicación (ADR-0001 rev. 3)
+DEDUP_INDEX_NAME = "ux_documents_active_sha256"
+
+
+def _is_dedup_violation(exc: IntegrityError) -> bool:
+    """True SOLO si la violación corresponde al índice de deduplicación.
+
+    Nunca se enmascaran otras violaciones de integridad (claves primarias,
+    `ux_versions_document_number`, checks) como `ING_DUPLICATE`: solo una
+    violación del índice parcial `ux_documents_active_sha256` es un
+    duplicado de contenido (409 ING_DUPLICATE).
+    """
+    orig = getattr(exc, "orig", None) or getattr(exc, "__cause__", None)
+    constraint = getattr(orig, "constraint_name", None) or getattr(
+        orig, "constraint", None
+    )
+    if constraint is None:
+        # Fallback: algunos drivers solo exponen el mensaje del servidor.
+        return orig is not None and DEDUP_INDEX_NAME in str(orig)
+    return constraint == DEDUP_INDEX_NAME
 
 
 def _document_from_row(row) -> DocumentRecord:
@@ -211,24 +237,124 @@ class CatalogRepository:
 
     # -- documents ---------------------------------------------------------
 
-    async def create_document(self, record: DocumentRecord) -> None:
-        """Inserta el documento; falla si el document_id ya existe."""
+    async def create_document(self, record: DocumentRecord, *, sha256: str) -> None:
+        """Inserta el documento con su claim de huella; falla si ya existe.
+
+        - `sha256` es el claim de dedup (ADR-0001 rev. 3): una huella solo
+          puede estar reclamada por UN documento vivo.
+        - La violación del índice de dedup se traduce a DuplicateDocumentError
+          (409 ING_DUPLICATE); cualquier otra violación de integridad se
+          propaga sin traducir.
+        """
         now = datetime.now(UTC)
-        async with self._connection() as conn:
-            await conn.execute(
-                insert(documents).values(
-                    document_id=record.document_id,
-                    filename=record.filename,
-                    subject=record.subject,
-                    active_version_id=record.active_version_id,
-                    editorial_status=record.editorial_status,
-                    review_status=record.review_status,
-                    uploaded_by=record.uploaded_by,
-                    created_at=now,
-                    updated_at=now,
-                    deleted_at=None,
+        try:
+            async with self._connection() as conn:
+                await conn.execute(
+                    insert(documents).values(
+                        document_id=record.document_id,
+                        filename=record.filename,
+                        subject=record.subject,
+                        active_version_id=record.active_version_id,
+                        editorial_status=record.editorial_status,
+                        review_status=record.review_status,
+                        uploaded_by=record.uploaded_by,
+                        sha256=sha256,
+                        created_at=now,
+                        updated_at=now,
+                        deleted_at=None,
+                    )
                 )
-            )
+        except IntegrityError as exc:
+            if not _is_dedup_violation(exc):
+                raise
+            await self._raise_duplicate(sha256, exc)
+
+    async def create_document_atomic(
+        self,
+        record: DocumentRecord,
+        *,
+        sha256: str,
+        version: DocumentVersion,
+        job: IngestionJob,
+        ops: list[PendingIndexOp],
+    ) -> None:
+        """Registro ATÓMICO: documento + claim + versión + job + outbox.
+
+        Todo ocurre en UNA única transacción: un fallo en cualquier paso
+        produce rollback completo (sin versiones `queued`, jobs ni ops
+        huérfanas). El claim (`documents.sha256`) nace con el documento, de
+        modo que el dedup es válido desde el registro, no desde la activación.
+        La violación de `ux_documents_active_sha256` (otro documento vivo
+        reclama la huella, incluso en carrera) se traduce a
+        DuplicateDocumentError (409 ING_DUPLICATE).
+        """
+        now = datetime.now(UTC)
+        try:
+            async with self._connection() as conn:
+                await conn.execute(
+                    insert(documents).values(
+                        document_id=record.document_id,
+                        filename=record.filename,
+                        subject=record.subject,
+                        active_version_id=record.active_version_id,
+                        editorial_status=record.editorial_status,
+                        review_status=record.review_status,
+                        uploaded_by=record.uploaded_by,
+                        sha256=sha256,
+                        created_at=now,
+                        updated_at=now,
+                        deleted_at=None,
+                    )
+                )
+                await self._insert_version(conn, version)
+                await self._insert_job(conn, job)
+                for op in ops:
+                    await self._insert_op(conn, op)
+        except IntegrityError as exc:
+            if not _is_dedup_violation(exc):
+                raise
+            await self._raise_duplicate(sha256, exc)
+
+    async def _raise_duplicate(self, sha256: str, exc: IntegrityError) -> None:
+        """Re-lanza la violación como ING_DUPLICATE con el reclamante actual.
+
+        La unicidad es del índice parcial: SIEMPRE que la violación sea de
+        `ux_documents_active_sha256` se traduce a `DuplicateDocumentError`,
+        aunque el reclamante no tenga una versión recuperable con esa huella
+        (el claim vive en `documents.sha256`, no en `document_versions`):
+        en ese caso `existing_version_id` es `None`. Solo si el reclamante
+        desapareció durante la carrera (fue borrado entre la violación y
+        esta consulta) se re-lanza la IntegrityError original (la unicidad
+        es de PostgreSQL, no del check de aplicación).
+        """
+        existing = await self.find_active_version_by_sha256(sha256)
+        if existing is not None:
+            raise DuplicateDocumentError(existing.document_id, existing.version_id) from exc
+        claimant = await self._find_active_claimant(sha256)
+        if claimant is not None:
+            raise DuplicateDocumentError(claimant, None) from exc
+        raise exc
+
+    async def _find_active_claimant(self, sha256: str) -> str | None:
+        """`document_id` vivo que reclama la huella vía `documents.sha256`.
+
+        A diferencia de `find_active_version_by_sha256` (pre-check de
+        conveniencia, exige versión recuperable), este lookup refleja el
+        claim puro: es el que garantiza la traducción SIEMPRE que el índice
+        de dedup viole en escritura.
+        """
+        async with self._connection() as conn:
+            row = (
+                await conn.execute(
+                    select(documents.c.document_id)
+                    .where(
+                        documents.c.sha256 == sha256,
+                        documents.c.deleted_at.is_(None),
+                    )
+                    .limit(1)
+                )
+            ).first()
+        return row[0] if row is not None else None
 
     async def get_document(self, document_id: str) -> DocumentRecord:
         async with self._connection() as conn:
@@ -294,21 +420,65 @@ class CatalogRepository:
     async def create_version(self, version: DocumentVersion) -> None:
         """Inserta una versión inmutable (nunca se actualiza su contenido)."""
         async with self._connection() as conn:
-            await conn.execute(
-                insert(document_versions).values(
-                    version_id=version.version_id,
-                    document_id=version.document_id,
-                    version_number=version.version_number,
-                    sha256=version.sha256,
-                    storage_key=version.storage_key,
-                    content_type=version.content_type,
-                    size_bytes=version.size_bytes,
-                    status=version.status,
-                    page_count=version.page_count,
-                    error_code=version.error_code,
-                    created_at=datetime.now(UTC),
-                )
+            await self._insert_version(conn, version)
+
+    async def _insert_version(self, conn: AsyncConnection, version: DocumentVersion) -> None:
+        await conn.execute(
+            insert(document_versions).values(
+                version_id=version.version_id,
+                document_id=version.document_id,
+                version_number=version.version_number,
+                sha256=version.sha256,
+                storage_key=version.storage_key,
+                content_type=version.content_type,
+                size_bytes=version.size_bytes,
+                status=version.status,
+                page_count=version.page_count,
+                error_code=version.error_code,
+                created_at=datetime.now(UTC),
             )
+        )
+
+    async def create_version_with_claim(
+        self,
+        version: DocumentVersion,
+        *,
+        claim_sha256: str,
+        job: IngestionJob,
+        ops: list[PendingIndexOp],
+    ) -> DocumentVersion:
+        """Nueva versión + traslado del claim de huella, en UNA transacción.
+
+        Alta atómica de versión (registro inicial y restauración, ADR-0001
+        rev. 3): en la misma transacción se mueve el claim
+        (`documents.sha256`), se inserta la versión, el job y las ops del
+        outbox. Si OTRO documento vivo ya reclama esa huella, PostgreSQL
+        rechaza el UPDATE por `ux_documents_active_sha256` y TODO se revierte
+        (sin versión, job ni ops parciales) → DuplicateDocumentError
+        (409 ING_DUPLICATE). Actualizar el claim de un documento a su propia
+        huella actual no viola el índice (restauración idempotente).
+        """
+        try:
+            async with self._connection() as conn:
+                result = await conn.execute(
+                    update(documents)
+                    .where(
+                        documents.c.document_id == version.document_id,
+                        documents.c.deleted_at.is_(None),
+                    )
+                    .values(sha256=claim_sha256, updated_at=datetime.now(UTC))
+                )
+                if not result.rowcount:
+                    raise NotFoundError("Documento", version.document_id)
+                await self._insert_version(conn, version)
+                await self._insert_job(conn, job)
+                for op in ops:
+                    await self._insert_op(conn, op)
+        except IntegrityError as exc:
+            if not _is_dedup_violation(exc):
+                raise
+            await self._raise_duplicate(claim_sha256, exc)
+        return version
 
     async def get_version(self, version_id: str) -> DocumentVersion:
         async with self._connection() as conn:
@@ -336,31 +506,60 @@ class CatalogRepository:
         return [_version_from_row(row) for row in rows]
 
     async def find_active_version_by_sha256(self, sha256: str) -> DocumentVersion | None:
-        """Busca una versión no eliminada con la huella dada (dedup, ADR-0001).
+        """Busca el reclamante vigente de una huella (dedup, ADR-0001 rev. 3).
 
-        Devuelve None si ninguna versión vigente comparte la huella.
+        El claim vive en `documents.sha256` y existe mientras el documento
+        esté vivo (`deleted_at IS NULL`): desde el registro de la primera
+        versión, durante toda la ingesta (incluso con la versión `failed` o
+        `queued`) y en estados editoriales intermedios (`withdrawn`,
+        `pending_review`). El borrado libera la huella (la fila sale del
+        índice parcial).
+
+        Devuelve la versión NO purgada (`status != 'deleting'`) más reciente
+        con esa huella del documento reclamante, o None si nadie reclama la
+        huella. Pre-check de conveniencia: la garantía final es el índice
+        único (ver `create_document_atomic` / `create_version_with_claim`).
         """
         async with self._connection() as conn:
-            row = (
+            doc_row = (
+                await conn.execute(
+                    select(documents.c.document_id)
+                    .where(
+                        documents.c.sha256 == sha256,
+                        documents.c.deleted_at.is_(None),
+                    )
+                    .limit(1)
+                )
+            ).first()
+            if doc_row is None:
+                return None
+            version_row = (
                 await conn.execute(
                     select(document_versions)
-                    .join(
-                        documents,
-                        documents.c.document_id == document_versions.c.document_id,
-                    )
                     .where(
+                        document_versions.c.document_id == doc_row[0],
                         document_versions.c.sha256 == sha256,
-                        documents.c.deleted_at.is_(None),
                         document_versions.c.status != "deleting",
                     )
-                    .order_by(document_versions.c.created_at)
+                    .order_by(document_versions.c.version_number.desc())
                     .limit(1)
                 )
             ).mappings().first()
-        return _version_from_row(row) if row is not None else None
+        # Si el documento reclama la huella pero no tiene versión vigente
+        # (solo posible en bases heredadas), se devuelve None: la unicidad
+        # real la garantiza el índice en la escritura.
+        return _version_from_row(version_row) if version_row is not None else None
 
-    async def update_version_status(self, version_id: str, target: str) -> None:
-        """Transición técnica de versión validada contra las reglas (ADR-0005)."""
+    async def update_version_status(
+        self, version_id: str, target: str
+    ) -> DocumentVersion:
+        """Transición técnica de versión validada contra las reglas (ADR-0005).
+
+        Devuelve la versión actualizada re-consultada tras el UPDATE: el
+        worker propaga el estado por el ciclo (queued -> processing ->
+        indexing -> available) y necesita la fila fresca (incluido
+        `error_code` reseteado a None por la transición).
+        """
         current_version = await self.get_version(version_id)
         current = current_version.status
         if not is_version_transition_valid(current, target):
@@ -371,6 +570,7 @@ class CatalogRepository:
                 .where(document_versions.c.version_id == version_id)
                 .values(status=target, error_code=None)
             )
+        return await self.get_version(version_id)
 
     async def mark_version_failed(self, version_id: str, error_code: str) -> None:
         """Marca una versión como fallida con su código estable (ADR-0005)."""
@@ -445,19 +645,22 @@ class CatalogRepository:
     # -- ingestion_jobs ------------------------------------------------------
 
     async def create_job(self, job: IngestionJob) -> None:
-        now = datetime.now(UTC)
         async with self._connection() as conn:
-            await conn.execute(
-                insert(ingestion_jobs).values(
-                    job_id=job.job_id,
-                    document_id=job.document_id,
-                    version_id=job.version_id,
-                    status=job.status,
-                    error_code=job.error_code,
-                    created_at=now,
-                    updated_at=now,
-                )
+            await self._insert_job(conn, job)
+
+    async def _insert_job(self, conn: AsyncConnection, job: IngestionJob) -> None:
+        now = datetime.now(UTC)
+        await conn.execute(
+            insert(ingestion_jobs).values(
+                job_id=job.job_id,
+                document_id=job.document_id,
+                version_id=job.version_id,
+                status=job.status,
+                error_code=job.error_code,
+                created_at=now,
+                updated_at=now,
             )
+        )
 
     async def get_job(self, job_id: str) -> IngestionJob:
         async with self._connection() as conn:
@@ -484,18 +687,21 @@ class CatalogRepository:
 
     async def enqueue_pending_op(self, op: PendingIndexOp) -> None:
         async with self._connection() as conn:
-            await conn.execute(
-                insert(pending_index_ops).values(
-                    op_id=op.op_id,
-                    version_id=op.version_id,
-                    destination=op.destination,
-                    operation=op.operation,
-                    status=op.status,
-                    attempts=op.attempts,
-                    last_error_code=op.last_error_code,
-                    created_at=datetime.now(UTC),
-                )
+            await self._insert_op(conn, op)
+
+    async def _insert_op(self, conn: AsyncConnection, op: PendingIndexOp) -> None:
+        await conn.execute(
+            insert(pending_index_ops).values(
+                op_id=op.op_id,
+                version_id=op.version_id,
+                destination=op.destination,
+                operation=op.operation,
+                status=op.status,
+                attempts=op.attempts,
+                last_error_code=op.last_error_code,
+                created_at=datetime.now(UTC),
             )
+        )
 
     async def claim_pending_ops(self, destination: str, limit: int = 10) -> list[PendingIndexOp]:
         """Devuelve operaciones pendientes de un destino (el worker las procesa)."""

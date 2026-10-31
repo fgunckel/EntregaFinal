@@ -53,6 +53,19 @@ ADA_LLM_MODEL=gpt-5.4-mini
 ADA_LLM_API_KEY=sk-...    # o OPENAI_API_KEY; nunca versionar la clave real
 ```
 
+Variante **Groq** (endpoint OpenAI-compatible, mismo extra `llm`, sin
+dependencias nuevas):
+
+```env
+ADA_LLM_PROVIDER=groq
+ADA_LLM_MODEL=openai/gpt-oss-120b
+ADA_LLM_API_KEY=gsk-...   # o GROQ_API_KEY; nunca versionar la clave real
+```
+
+La factory fija el endpoint oficial (`https://api.groq.com/openai/v1`) y
+`reasoning_format=parsed`: los modelos gpt-oss razonan y, sin ese parámetro,
+su cadena de análisis contaminaría la explicación mostrada al estudiante.
+
 Garantías (decisiones aprobadas TASK-11):
 
 - El modelo se construye **una vez por proceso** (lifespan de la API) y solo
@@ -89,6 +102,26 @@ docker compose up -d
 # 2. Crear el esquema (idempotente)
 export DATABASE_URL="postgresql+asyncpg://ada:ada_dev_password@localhost:5432/ada_study"
 python -m ada_study.db.create_schema "$DATABASE_URL"
+
+
+### Base existente: migración a rev. 3 (claim en `documents.sha256`)
+
+`create_all` NO modifica tablas existentes. Para una base creada con el
+esquema anterior, la migración idempotente y no destructiva es:
+
+```bash
+python -m ada_study.db.migrate "$DATABASE_URL"
+```
+
+Pasos: agrega `documents.sha256` si falta; completa el claim de cada
+documento con la huella de su versión más reciente no purgada; detecta
+conflictos de huella entre documentos vivos (aborta SIN crear el índice y
+SIN modificar datos si existen); crea el índice único parcial
+`ux_documents_active_sha256` y retira el índice heredado
+`ux_versions_active_sha256`. Puede ejecutarse N veces (idempotente);
+`python -m ada_study.db.create_schema "$DATABASE_URL"` también sirve: crea el
+esquema limpio en rev. 3 y ejecuta la migración como verificación final.
+Código de salida 2 = conflicto de huellas pendiente de resolución editorial.
 
 # 3. Crear la cuenta admin inicial (interactivo, contraseña por stdin)
 python -m ada_study.cli "$DATABASE_URL"

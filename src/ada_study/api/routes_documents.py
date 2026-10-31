@@ -24,6 +24,7 @@ from ada_study.config import Settings
 from ada_study.contracts.identity import UserRecord
 from ada_study.db.repository import (
     CatalogError,
+    DuplicateDocumentError,
     InvalidTransitionError,
     NotFoundError,
 )
@@ -393,6 +394,14 @@ async def restore_version(
             status_code=409,
             content=_error_payload("DEL_CONFLICT", str(exc)),
         )
+    except DuplicateDocumentError as exc:
+        # Dedup (ADR-0001 rev. 3): otro documento vivo reclama la huella
+        # histórica. Mismo contrato que en upload (409 ING_DUPLICATE).
+        return JSONResponse(
+            status_code=409,
+            content=_error_payload(exc.error_code, str(exc)),
+        )
+
 
     return JSONResponse(
         status_code=202,

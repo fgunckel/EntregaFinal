@@ -1,4 +1,4 @@
-"""Esquema PostgreSQL del catálogo documental (ADR-0001, rev. 2).
+"""Esquema PostgreSQL del catálogo documental (ADR-0001, rev. 3).
 
 SQLAlchemy Core async + asyncpg (decisión aprobada en TASK-02).
 Tablas: documents, document_versions, document_chunks, ingestion_jobs,
@@ -73,6 +73,14 @@ documents = Table(
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
     Column("updated_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
     Column("deleted_at", DateTime(timezone=True), nullable=True),
+    # Claim de huella (ADR-0001 rev. 3): sha256 que el documento hace valer
+    # mientras está vivo (`deleted_at IS NULL`). Se fija en el registro de la
+    # primera versión y se mueve en la MISMA transacción que cada alta de
+    # versión (restauración). `deleted_at` libera el claim; `withdrawn` y las
+    # versiones `failed`/`queued` lo RETIENEN (el dedup no depende del estado
+    # técnico de la versión). NULL solo en bases heredadas pendientes de
+    # backfill (ver `db/migrations.py`).
+    Column("sha256", String(64), nullable=True),
     CheckConstraint(_check_in("editorial_status", EDITORIAL_VALUES), name="ck_documents_editorial"),
     CheckConstraint(
         _check_in(
@@ -101,17 +109,20 @@ document_versions = Table(
     CheckConstraint("size_bytes >= 0", name="ck_versions_size"),
 )
 
-# Dedup: una versión activa por huella. Índice único parcial (ADR-0001):
-# solo aplica a versiones no eliminadas; versiones históricas con la misma
-# huella son legítimas (restauración).
+# Dedup (ADR-0001 rev. 3): la unicidad de huella vive a nivel DOCUMENTO.
+# La rev. 2 usaba un índice parcial sobre `document_versions.sha256` con
+# predicado `document_id IN (SELECT ...)`; PostgreSQL no soporta subconsultas
+# en predicados de índice (`cannot use subquery in index predicate`) y bloqueaba
+# `metadata.create_all`. Además era semánticamente incorrecto: las versiones
+# históricas de un mismo documento comparten huella legítimamente (restauración)
+# y el claim debe existir desde el registro, no desde la activación.
+# Solución: claim desnormalizado en `documents.sha256` + índice único parcial
+# sobre documentos vivos. La migración idempotente está en `db/migrations.py`.
 Index(
-    "ux_versions_active_sha256",
-    document_versions.c.sha256,
+    "ux_documents_active_sha256",
+    documents.c.sha256,
     unique=True,
-    postgresql_where=text(
-        "status NOT IN ('deleting') AND document_id IN "
-        "(SELECT document_id FROM documents WHERE deleted_at IS NULL)"
-    ),
+    postgresql_where=text("deleted_at IS NULL"),
 )
 
 # Unicidad de version_number por documento
