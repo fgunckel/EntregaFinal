@@ -19,6 +19,14 @@ estado. Al arrancar, el índice BM25 se reconstruye desde `document_chunks`
 persistidos; NO se agrega persistencia JSON del índice como fuente adicional
 de estado. `to_state` / `from_state` quedan como utilidades de diagnóstico y
 respaldo puntual, no como mecanismo de estado entre reinicios.
+
+Matching léxico (RAG-QUALITY-01, D-2): las consultas se tokenizan con
+`significant_terms`, que excluye una lista pequeña y explícita de palabras
+funcionales del español (`_STOPWORDS`). Así una consulta cuyos únicos
+términos son funcionales no produce "evidencia" aparente por coincidencia
+léxica marginal, y los términos académicos, números y nombres propios se
+conservan íntegros. Limitación conocida: no hay stemming ni comprensión
+semántica; la relevancia léxica no equivale a relevancia semántica.
 """
 
 import json
@@ -31,10 +39,66 @@ _TOKEN_PATTERN = re.compile(r"\w+", flags=re.UNICODE)
 _K1 = 1.5
 _B = 0.75
 
+# Palabras funcionales frecuentes del español (lista pequeña y explícita,
+# RAG-QUALITY-01 D-2). Solo excluyen palabras funcionales: números, nombres
+# propios y términos académicos NUNCA están en esta lista. Se listan las
+# variantes con y sin tilde porque `tokenize` conserva los acentos.
+_STOPWORDS = frozenset(
+    {
+        # Artículos y determinantes
+        "el", "él", "la", "los", "las", "un", "una", "unos", "unas", "lo",
+        "mi", "mis", "tu", "tus", "su", "sus", "nuestro", "nuestra",
+        # Preposiciones y conjunciones
+        "a", "al", "ante", "bajo", "con", "contra", "de", "del", "desde",
+        "durante", "en", "entre", "hacia", "hasta", "mediante", "para",
+        "por", "segun", "según", "sin", "sobre", "tras", "e", "o", "u", "y",
+        "ni", "pero", "porque", "pues", "mientras",
+        # Pronombres
+        "yo", "me", "nos", "te", "se", "le", "les", "ella", "ello", "ellos",
+        "ellas", "usted", "ustedes", "quien", "quienes", "cual", "cuál",
+        "cuales", "cuáles", "cuyo", "cuya", "donde",
+        # Verbos funcionales (cópula, auxiliares, haber/ser/estar/poder/deber)
+        "es", "son", "soy", "eres", "fue", "fueron", "era", "eran", "ser",
+        "sea", "sido", "estar", "esta", "está", "estan", "están", "ha",
+        "han", "hay", "habia", "había", "habian", "habían", "haber", "he",
+        "haya", "puede", "pueden", "debe", "deben",
+        # Interrogativos (no identifican contenido por sí solos)
+        "que", "qué", "como", "cómo", "cuando", "cuándo", "cuanto",
+        "cuánto", "cuantos", "cuántos", "dónde", "quien", "quién",
+        # Adverbios funcionales
+        "no", "si", "sí", "mas", "más", "muy", "ya", "aun", "aún", "asi",
+        "así", "entonces", "tampoco", "tambien", "también", "ademas",
+        "además", "según",
+    }
+)
+
 
 def tokenize(text: str) -> list[str]:
-    """Normaliza el texto en tokens minúsculas (misma convención que M4)."""
+    """Normaliza el texto en tokens minúsculas (misma convención que M4).
+
+    No filtra stopwords: el filtrado léxico ocurre en la consulta vía
+    `significant_terms` (los términos funcionales del corpus nunca son
+    consultables y por tanto no dominan la recuperación).
+    """
     return _TOKEN_PATTERN.findall(text.lower())
+
+
+def significant_terms(text: str) -> list[str]:
+    """Términos significativos del texto: sin stopwords, únicos y en orden.
+
+    Criterio léxico mínimo (RAG-QUALITY-01, D-2): define tanto los términos
+    de consulta de BM25 como los términos significativos usados por el
+    researcher para evaluar pertinencia de la evidencia. Números, nombres
+    propios y términos académicos se conservan íntegros.
+    """
+    seen: set[str] = set()
+    terms: list[str] = []
+    for token in tokenize(text):
+        if token in _STOPWORDS or token in seen:
+            continue
+        seen.add(token)
+        terms.append(token)
+    return terms
 
 
 class BM25Index:
@@ -109,14 +173,25 @@ class BM25Index:
 
     # -- consulta -------------------------------------------------------------
 
+    def document_frequency(self, term: str) -> int:
+        """Cantidad de chunks indexados que contienen el término (df).
+
+        Estadística de corpus para el researcher (RAG-QUALITY-03): permite
+        distinguir términos temáticos (discriminativos) de genéricos
+        (encabezados repetidos, restricciones de fuente, palabras ubicuas).
+        """
+        return len(self._df.get(term, set()))
+
     def search(self, query: str, top_k: int = 5) -> list[tuple[str, float]]:
         """Devuelve los (chunk_id, score) con mayor relevancia BM25."""
         if not query.strip():
             raise ValueError("La consulta no puede estar vacía")
         if top_k < 1:
             raise ValueError("top_k debe ser al menos 1")
-        query_terms = tokenize(query)
+        query_terms = significant_terms(query)
         if not query_terms:
+            # Consulta sin términos significativos (solo palabras funcionales):
+            # devolver vacío, no "evidencia" por coincidencia léxica marginal.
             return []
         total_docs = len(self._postings)
         if total_docs == 0:

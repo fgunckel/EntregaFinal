@@ -20,5 +20,16 @@ services:
       timeout: 5s
       retries: 10
 
+  # Phoenix (AGENT-TRACE-01 §6): UI de trazas técnicas en http://localhost:6006.
+  # Opcional: levantar solo con `docker compose up -d phoenix`. La app exporta
+  # spans vía OTLP hacia http://localhost:6006/v1/traces cuando
+  # ADA_PHOENIX_ENABLED=true (endpoint: el que expone el colector de Phoenix).
+  phoenix:
+    image: arizephoenix/phoenix:latest
+    container_name: ada_study_phoenix
+    ports:
+      - "6006:6006"
+
 volumes:
   ada_pgdata:
+

@@ -12,6 +12,17 @@ from ada_study.ui import auth
 from ada_study.ui.api_client import ApiError
 
 
+def describe_queue_error(exc: ApiError) -> str:
+    """Mensaje controlado para fallos al cargar la cola (pura, testeable).
+
+    Muestra el código estable (ADR-0005) sin exponer el detalle interno
+    del backend (patrón de `study.describe_error`).
+    """
+    if exc.error_code == "AUTH_FORBIDDEN":
+        return "Tu rol no tiene acceso a la cola de moderación."
+    return f"No se pudo cargar la cola ({exc.error_code})."
+
+
 def render_moderation() -> None:
     """Cola de moderación con decisiones reales (moderator/admin)."""
     st.title("Moderación")
@@ -23,10 +34,7 @@ def render_moderation() -> None:
     try:
         queue = client.moderation_queue()
     except ApiError as exc:
-        if exc.error_code == "AUTH_FORBIDDEN":
-            st.error("Tu rol no tiene acceso a la cola de moderación.")
-        else:
-            st.error(f"No se pudo cargar la cola ({exc.error_code}).")
+        st.error(describe_queue_error(exc))
         return
 
     if not queue:

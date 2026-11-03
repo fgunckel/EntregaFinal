@@ -24,6 +24,10 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    # Conversaciones multi-turno (CHECKPOINTER-02/03). False (default) = modo
+    # efímero por petición (sin checkpointer ni estado conversacional).
+    ada_conversations_enabled: bool = False
+
     # PostgreSQL (única fuente de estado, ADR-0001). Obligatoria en runtime.
     database_url: str = ""
 
@@ -50,9 +54,18 @@ class Settings(BaseSettings):
     # Límites por llamada (política de costos TASK-11: máx. 1 llamada del tutor
     # por intento; máx. 3 por petición con las 2 reparaciones del validator).
     ada_llm_temperature: float = 0.0
-    ada_llm_max_tokens: int = Field(default=800, ge=1)
+    # 2000 tokens (LLM-CONFIG-01, antes 800): alcanza para explicaciones
+    # pedagógicas completas con títulos y listas sin inflar el costo por llamada.
+    ada_llm_max_tokens: int = Field(default=2000, ge=1)
     ada_llm_timeout_seconds: float = Field(default=20.0, gt=0)
     ada_llm_max_retries: int = Field(default=2, ge=0)
+
+    # Observabilidad técnica (AGENT-TRACE-01 §6): OpenInference/OTel hacia
+    # Phoenix. False (default) = sin instrumentación ni dependencias cargadas.
+    # Phoenix corre como servicio (docker-compose, puerto 6006); la app solo
+    # exporta spans por OTLP al endpoint configurado.
+    ada_phoenix_enabled: bool = False
+    ada_phoenix_endpoint: str = "http://localhost:6006/v1/traces"
 
 
 @lru_cache

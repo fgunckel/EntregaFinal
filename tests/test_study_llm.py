@@ -164,9 +164,14 @@ class TestChatModelFactoryGroq:
 
 
 class TestChatModelFactory:
-    def test_default_settings_return_none(self):
+    # NOTA hermeticidad: pydantic-settings lee el .env del repo; con
+    # `_env_file=None` estos tests ignoran tanto el archivo como cualquier
+    # contaminación ambiental (ADA_LLM_*), verificando SOLO los defaults.
+    def test_default_settings_return_none(self, monkeypatch):
         """Modo determinístico sin credenciales: provider 'none' → None."""
-        settings = Settings(database_url="postgresql+asyncpg://fake")
+        for var in ("ADA_LLM_PROVIDER", "ADA_LLM_MODEL", "ADA_LLM_API_KEY"):
+            monkeypatch.delenv(var, raising=False)
+        settings = Settings(database_url="postgresql+asyncpg://fake", _env_file=None)
         assert build_chat_model(settings) is None
 
     def test_openai_without_key_fails_fast(self, monkeypatch):
@@ -176,15 +181,19 @@ class TestChatModelFactory:
             database_url="postgresql+asyncpg://fake",
             ada_llm_provider="openai",
             ada_llm_model="gpt-5.4-mini",
+            ada_llm_api_key="",
+            _env_file=None,
         )
         with pytest.raises(LLMConfigError):
             build_chat_model(settings)
 
-    def test_openai_without_model_fails_fast(self):
+    def test_openai_without_model_fails_fast(self, monkeypatch):
+        monkeypatch.delenv("ADA_LLM_MODEL", raising=False)
         settings = Settings(
             database_url="postgresql+asyncpg://fake",
             ada_llm_provider="openai",
             ada_llm_api_key=_LIVE_KEY,
+            _env_file=None,
         )
         with pytest.raises(LLMConfigError):
             build_chat_model(settings)
@@ -272,7 +281,9 @@ class TestTutorWithFakeModel:
         assert LLM_FALLBACK_LIMITATION in response.limitations
 
     async def test_oversized_output_falls_back(self):
-        fake = FakeChatModel(response="x" * 5000)
+        # La cota vigente es 8000 (LLM-CONFIG-01): una salida de 9000 excede y
+        # activa el fallback determinístico con la limitación declarada.
+        fake = FakeChatModel(response="x" * 9000)
         response = await run_study(
             _seeded_repo(),
             "¿Qué es una fracción?",
@@ -280,7 +291,7 @@ class TestTutorWithFakeModel:
             chat_model=fake,
         )
         assert response.status == "complete"
-        assert len(response.explanation) <= 4000
+        assert len(response.explanation) <= 8000
         assert LLM_FALLBACK_LIMITATION in response.limitations
 
     async def test_insufficient_evidence_never_calls_llm(self):
@@ -295,6 +306,29 @@ class TestTutorWithFakeModel:
         assert response.status == "insufficient_evidence"
         assert response.references == []
         assert fake.calls == []  # sin evidencia no se consume LLM
+
+    async def test_llm_cannot_promote_irrelevant_evidence_to_complete(self):
+        """RAG-QUALITY-01 (D-1): con evidencia solo marginalmente léxica
+        (Matemática para una consulta de Historia), el estado se decide
+        determinísticamente y el LLM ni siquiera se invoca."""
+        fake = FakeChatModel(response="Respuesta factual inventada con seguridad.")
+        repo = FakeStudyRepository()
+        _seed_published_document(
+            repo, "doc_mat", "otro",
+            "Documento de Matemática de quinto grado: las fracciones "
+            "representan las partes iguales de un todo dividido.",
+        )
+        response = await run_study(
+            repo,
+            "Según el documento de Historia, ¿cuáles fueron las causas de la "
+            "Revolución de Mayo?",
+            ViewerContext(user_id="usr_stu", role="student"),
+            chat_model=fake,
+        )
+        assert response.status == "insufficient_evidence"
+        assert response.references == []
+        assert response.evidence_gaps
+        assert fake.calls == []  # sin evidencia pertinente no se consume LLM
 
     async def test_deterministic_mode_without_chat_model(self):
         """Sin credenciales ni modelo: comportamiento de TASK-10 intacto."""

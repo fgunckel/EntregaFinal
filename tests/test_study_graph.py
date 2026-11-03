@@ -171,7 +171,7 @@ async def _research_state(evidence_count=2):
 async def test_tutor_composes_response_from_evidence():
     state = await _research_state()
     node = make_tutor_node()
-    update = node(state)
+    update = await node(state)
     response = update["study_response"]
     assert response["status"] == "complete"
     assert response["references"]  # procedencia conservada
@@ -187,7 +187,7 @@ async def test_tutor_recognizes_insufficiency_without_evidence():
         "confidence_score": 0.0,
     }
     node = make_tutor_node()
-    update = node({"user_request": "x", "research_artifact": research})
+    update = await node({"user_request": "x", "research_artifact": research})
     response = update["study_response"]
     assert response["status"] == "insufficient_evidence"
     assert response["references"] == []
@@ -234,8 +234,10 @@ async def test_validator_accepts_consistent_artifacts():
     )["research_artifact"]
     from ada_study.graph.tutor import make_tutor_node
 
-    response = make_tutor_node()(
-        {"user_request": "energia mitocondria", "research_artifact": research}
+    response = (
+        await make_tutor_node()(
+            {"user_request": "energia mitocondria", "research_artifact": research}
+        )
     )["study_response"]
     update = validator_node(
         {"research_artifact": research, "study_response": response, "retries": 0}
@@ -335,3 +337,168 @@ async def test_limited_finish_never_fabricates():
     assert response["status"] == "limited"
     assert response["references"] == []
     assert response["evidence_gaps"]  # reconoce el límite explícitamente
+
+
+# ---------------------------------------------------------------------------
+# RAG-QUALITY-01: pertinencia de evidencia y suficiencia (D-1)
+# ---------------------------------------------------------------------------
+
+_QUERY_HISTORIA = (
+    "Según el documento de Historia, ¿cuáles fueron las causas de la "
+    "Revolución de Mayo?"
+)
+_HISTORIA_1 = (
+    "Las causas de la Revolución de Mayo fueron la invasión napoleónica "
+    "de España y la cautividad del rey."
+)
+_HISTORIA_2 = (
+    "La Revolución de Mayo de 1810 instituyó la Primera Junta de gobierno."
+)
+_MATEMATICA = (
+    "Documento de Matemática de quinto grado: las fracciones representan "
+    "las partes iguales de un todo dividido."
+)
+
+
+def _corpus_chunk(chunk_id: str, text: str, title: str, page: int) -> ChunkRecord:
+    return ChunkRecord(
+        chunk_id=chunk_id,
+        document_id="doc_1",
+        version_id="ver_1",
+        page=page,
+        chunk_index=page - 1,
+        content_hash="2" * 64,
+        text=text,
+        title=title,
+        source="pdf",
+    )
+
+
+def _corpus_historia_con_matematica() -> list[ChunkRecord]:
+    """Historia pertinente + Matemática con coincidencia léxica genérica."""
+    return [
+        _corpus_chunk("c3", _HISTORIA_1, "Historia", 1),
+        _corpus_chunk("c4", _HISTORIA_2, "Historia", 2),
+        _corpus_chunk("c5", _MATEMATICA, "Matemática", 3),
+    ]
+
+
+async def test_researcher_keeps_pertinent_and_drops_marginal_evidence():
+    """D-1: la evidencia de Historia se retiene; el fragmento de Matemática
+    que solo coincide por 'documento' NO pasa el umbral de pertinencia."""
+    retriever = _make_retriever(_corpus_historia_con_matematica())
+    node = make_researcher_node(retriever)
+    update = await node({"user_request": _QUERY_HISTORIA, "steps": 0, "retries": 0})
+    artifact = update["research_artifact"]
+    chunk_ids = [ref["chunk_id"] for ref in artifact["evidence"]]
+    assert chunk_ids == ["c3", "c4"]  # solo Historia: c5 filtrado
+    assert artifact["evidence_gaps"] == []  # cobertura y cantidad suficientes
+    assert artifact["confidence_score"] > 0
+
+
+async def test_researcher_five_irrelevant_chunks_do_not_support_query():
+    """Cinco fragmentos irrelevantes (coincidencia léxica marginal) no
+    producen evidencia ni 'complete': insuficiencia explícita."""
+    chunks = [
+        _corpus_chunk(f"m{i}", _MATEMATICA, "Matemática", i + 1) for i in range(5)
+    ]
+    retriever = _make_retriever(chunks)
+    node = make_researcher_node(retriever)
+    update = await node({"user_request": _QUERY_HISTORIA, "steps": 0, "retries": 0})
+    artifact = update["research_artifact"]
+    assert artifact["evidence"] == []
+    assert artifact["confidence_score"] == 0.0
+    assert artifact["evidence_gaps"] == [
+        "La evidencia recuperada no guarda relación pertinente con los "
+        "términos significativos de la consulta: los fragmentos solo "
+        "coinciden marginalmente y no se usan como respaldo."
+    ]
+
+
+async def test_researcher_historia_with_relevant_evidence_is_complete():
+    """Consulta de Historia + evidencia pertinente de Historia → 'complete'."""
+    retriever = _make_retriever(_corpus_historia_con_matematica())
+    research = (
+        await make_researcher_node(retriever)(
+            {"user_request": _QUERY_HISTORIA, "steps": 0, "retries": 0}
+        )
+    )["research_artifact"]
+    response = (
+        await make_tutor_node()(
+            {"user_request": _QUERY_HISTORIA, "research_artifact": research}
+        )
+    )["study_response"]
+    assert response["status"] == "complete"
+    assert [ref["chunk_id"] for ref in response["references"]] == ["c3", "c4"]
+
+
+_GAP_IRRELEVANTE = (
+    "La evidencia recuperada no guarda relación pertinente con los "
+    "términos significativos de la consulta."
+)
+
+
+async def test_tutor_declares_insufficient_for_irrelevant_evidence():
+    """Evidencia no pertinente → el tutor declara insuficiencia y NO genera
+    una respuesta factual como si estuviera respaldada."""
+    research = {
+        "query": _QUERY_HISTORIA,
+        "evidence": [],
+        "evidence_gaps": [_GAP_IRRELEVANTE],
+        "confidence_score": 0.0,
+    }
+    update = await make_tutor_node()(
+        {"user_request": _QUERY_HISTORIA, "research_artifact": research}
+    )
+    response = update["study_response"]
+    assert response["status"] == "insufficient_evidence"
+    assert response["references"] == []
+    assert response["evidence_gaps"] == [_GAP_IRRELEVANTE]
+
+
+def test_validator_rejects_formally_valid_references_without_relevance():
+    """El Validator no acepta referencias formalmente válidas como
+    sustituto de relevancia: sin evidencia del researcher, no hay 'complete'."""
+    research = {"query": "x", "evidence": [], "evidence_gaps": [], "confidence_score": 0.0}
+    response = _response_with_refs(["c1"])  # referencia bien formada
+    update = validator_node(
+        {"research_artifact": research, "study_response": response, "retries": 0}
+    )
+    result = update["validation_result"]
+    assert result["is_valid"] is False
+    assert any("relevancia" in error for error in result["tutor_errors"])
+
+
+async def test_synthesizer_preserves_insufficient_state():
+    """El Synthesizer conserva el estado de insuficiencia al publicar."""
+    research = {
+        "query": _QUERY_HISTORIA,
+        "evidence": [],
+        "evidence_gaps": [_GAP_IRRELEVANTE],
+        "confidence_score": 0.0,
+    }
+    tutor_update = await make_tutor_node()(
+        {"user_request": _QUERY_HISTORIA, "research_artifact": research}
+    )
+    validation = validator_node(
+        {
+            "research_artifact": research,
+            "study_response": tutor_update["study_response"],
+            "retries": 0,
+        }
+    )
+    assert validation["validation_result"]["is_valid"] is True
+    from ada_study.graph.synthesizer import synthesizer_node
+
+    published = synthesizer_node(
+        {
+            "study_response": tutor_update["study_response"],
+            "validation_result": validation["validation_result"],
+            "conversation_history": [],
+            "contributions": [],
+            "steps": 1,
+        }
+    )
+    assert published["study_response"]["status"] == "insufficient_evidence"
+    assert published["study_response"]["references"] == []
+    assert published["study_response"]["evidence_gaps"] == [_GAP_IRRELEVANTE]

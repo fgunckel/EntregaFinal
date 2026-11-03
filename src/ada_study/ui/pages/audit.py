@@ -11,6 +11,13 @@ from ada_study.ui import auth
 from ada_study.ui.api_client import ApiError
 
 
+def describe_audit_error(exc: ApiError) -> str:
+    """Mensaje controlado para fallos al cargar eventos (pura, testeable)."""
+    if exc.error_code == "AUTH_FORBIDDEN":
+        return "Tu rol no tiene acceso a la auditoría."
+    return f"No se pudieron cargar los eventos ({exc.error_code})."
+
+
 def render_audit() -> None:
     """Eventos de auditoría reales (moderator/admin)."""
     st.title("Auditoría")
@@ -34,10 +41,7 @@ def render_audit() -> None:
             limit=int(limit),
         )
     except ApiError as exc:
-        if exc.error_code == "AUTH_FORBIDDEN":
-            st.error("Tu rol no tiene acceso a la auditoría.")
-        else:
-            st.error(f"No se pudieron cargar los eventos ({exc.error_code}).")
+        st.error(describe_audit_error(exc))
         return
 
     if not events:

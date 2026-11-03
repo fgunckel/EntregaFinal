@@ -26,7 +26,23 @@ from ada_study.db.repository import DuplicateDocumentError, NotFoundError
 pytest.importorskip("sqlalchemy")
 pytest.importorskip("asyncpg")
 
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
+def _database_url_from_project_config() -> str:
+    """Resuelve la URL desde la configuración del repo (.env), no ambiental.
+
+    Hermético (preflight CHECKPOINTER-03): ignora cualquier `DATABASE_URL`
+    ambiental de la sesión que apunte a credenciales ajenas al proyecto.
+    """
+    from ada_study.config import Settings
+
+    saved = os.environ.pop("DATABASE_URL", None)
+    try:
+        return Settings().database_url.strip()
+    finally:
+        if saved is not None:
+            os.environ["DATABASE_URL"] = saved
+
+
+DATABASE_URL = _database_url_from_project_config()
 
 pytestmark = pytest.mark.skipif(
     not DATABASE_URL,

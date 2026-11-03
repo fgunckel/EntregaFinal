@@ -29,6 +29,13 @@ ui = [
 llm = [
     "langchain-openai>=1.7,<2.0",
 ]
+observability = [
+    # AGENT-TRACE-01 §6: instrumentación OpenInference de LangChain/LangGraph
+    # con exportación OTLP hacia Phoenix (servicio en docker-compose, UI :6006).
+    "openinference-instrumentation-langchain>=0.1.50,<2.0",
+    "opentelemetry-sdk>=1.25,<3.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.25,<3.0",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

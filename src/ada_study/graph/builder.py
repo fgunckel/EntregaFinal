@@ -25,6 +25,7 @@ from ada_study.graph.state import AgentName, AgentState
 from ada_study.graph.synthesizer import limited_finish_node, synthesizer_node
 from ada_study.graph.tutor import make_tutor_node
 from ada_study.graph.validator import validator_node
+from ada_study.observability.trace import new_event, traced_node
 
 Worker = Callable[[dict], dict]
 
@@ -65,11 +66,24 @@ def make_supervisor_node(chat_model) -> Worker:
             next_agent = "validator"
             reason = "Validación rechazada; reparar artefactos."
 
+        # Decisión de enrutado trazable (AGENT-TRACE-01 §3.1): próximo nodo
+        # y motivo real de la decisión.
+        decision_event = new_event(
+            "supervisor",
+            "decision",
+            f"Enrutado a {next_agent}: {reason}",
+            details={
+                "next_agent": next_agent,
+                "reason": reason,
+                "steps": steps + 1,
+            },
+        )
         return {
             "next_agent": next_agent,
             "routing_reason": reason,
             "task_completed": False,
             "steps": steps + 1,
+            "trace_events": [decision_event],
         }
 
     supervisor_node = _supervisor_with_model(chat_model) if chat_model else supervisor_node
@@ -90,6 +104,21 @@ def _supervisor_with_model(chat_model):
             "routing_reason": decision.reason,
             "task_completed": decision.task_completed,
             "steps": state.get("steps", 0) + 1,
+            # Decisión estructurada real del modelo (AGENT-TRACE-01 §3.1):
+            # próximo nodo propuesto, motivo y estado de la tarea.
+            "trace_events": [
+                new_event(
+                    "supervisor",
+                    "decision",
+                    f"Enrutado a {decision.next_agent}: {decision.reason}",
+                    details={
+                        "next_agent": decision.next_agent,
+                        "reason": decision.reason,
+                        "task_completed": decision.task_completed,
+                        "steps": state.get("steps", 0) + 1,
+                    },
+                )
+            ],
         }
 
     return supervisor_node
@@ -153,12 +182,16 @@ def build_graph(chat_model=None, retriever=None, tutor_model=None):
     """
     graph = StateGraph(AgentState)
 
-    graph.add_node("supervisor", make_supervisor_node(chat_model))
-    graph.add_node("researcher", make_researcher_node(retriever))
-    graph.add_node("tutor", make_tutor_node(tutor_model))
-    graph.add_node("validator", validator_node)
-    graph.add_node("synthesizer", synthesizer_node)
-    graph.add_node("limited_finish", limited_finish_node)
+    # Cada nodo se envuelve con `traced_node` (AGENT-TRACE-01): registra
+    # inicio/fin/duración REALES de cada ejecución (incluyendo reintentos) y
+    # combina los eventos de decisión que el nodo emite. La topología, la
+    # mecánica M7 y la semántica de los updates quedan intactas.
+    graph.add_node("supervisor", traced_node("supervisor", make_supervisor_node(chat_model)))
+    graph.add_node("researcher", traced_node("researcher", make_researcher_node(retriever)))
+    graph.add_node("tutor", traced_node("tutor", make_tutor_node(tutor_model)))
+    graph.add_node("validator", traced_node("validator", validator_node))
+    graph.add_node("synthesizer", traced_node("synthesizer", synthesizer_node))
+    graph.add_node("limited_finish", traced_node("limited_finish", limited_finish_node))
 
     graph.add_edge(START, "supervisor")
     graph.add_conditional_edges(
@@ -195,13 +228,14 @@ def build_graph(chat_model=None, retriever=None, tutor_model=None):
     return graph
 
 
-def compile_graph(chat_model=None, retriever=None, tutor_model=None):
+def compile_graph(chat_model=None, retriever=None, tutor_model=None, checkpointer=None):
     """Construye y compila el grafo de estudio.
 
     `chat_model` (supervisor) permanece None en producción (enrutado
     determinístico, decisión TASK-11); `tutor_model` es el chat model del
-    tutor, construido una vez por proceso.
+    tutor, construido una vez por proceso; `checkpointer` (opcional,
+    CHECKPOINTER-01) habilita la persistencia del estado por `thread_id`.
     """
     return build_graph(
         chat_model=chat_model, retriever=retriever, tutor_model=tutor_model
-    ).compile()
+    ).compile(checkpointer=checkpointer)

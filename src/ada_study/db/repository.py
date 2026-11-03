@@ -4,6 +4,7 @@ Funciones tipadas de acceso a datos, sin lógica de negocio. Toda transición
 de estado pasa por las reglas de `state_rules` antes de persistir.
 """
 
+import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -12,6 +13,7 @@ from sqlalchemy import delete, insert, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+from ada_study.contracts.conversations import ConversationRecord
 from ada_study.contracts.documents import (
     DocumentRecord,
     DocumentVersion,
@@ -26,6 +28,7 @@ from ada_study.contracts.identity import (
 )
 from ada_study.db.schema import (
     audit_events,
+    conversations,
     document_chunks,
     document_versions,
     documents,
@@ -1079,3 +1082,52 @@ class CatalogRepository:
         async with self._connection() as conn:
             rows = (await conn.execute(query)).mappings().all()
         return [_audit_from_row(row) for row in rows]
+
+    # -- conversations (CHECKPOINTER-02) --------------------------------------
+
+    async def create_conversation(self, record: ConversationRecord) -> None:
+        """Inserta la conversación; el UUID y el thread los genera el servidor."""
+        async with self._connection() as conn:
+            await conn.execute(
+                insert(conversations).values(
+                    conversation_id=uuid.UUID(record.conversation_id),
+                    user_id=record.user_id,
+                    thread_id=record.thread_id,
+                    created_at=datetime.fromisoformat(record.created_at),
+                    last_turn_at=datetime.fromisoformat(record.last_turn_at),
+                    turn_count=record.turn_count,
+                )
+            )
+
+    async def get_conversation(self, conversation_id: str) -> ConversationRecord | None:
+        """Conversación por UUID, o None si no existe (la titularidad se
+        verifica en ConversationService, nunca aquí)."""
+        async with self._connection() as conn:
+            row = (
+                await conn.execute(
+                    select(conversations).where(
+                        conversations.c.conversation_id == uuid.UUID(conversation_id)
+                    )
+                )
+            ).mappings().first()
+        return _conversation_from_row(row) if row is not None else None
+
+    async def record_conversation_turn(self, conversation_id: str) -> None:
+        """Incrementa `turn_count` y actualiza `last_turn_at` (átomico en SQL)."""
+        async with self._connection() as conn:
+            await conn.execute(
+                update(conversations)
+                .where(conversations.c.conversation_id == uuid.UUID(conversation_id))
+                .values(last_turn_at=datetime.now(UTC), turn_count=conversations.c.turn_count + 1)
+            )
+
+
+def _conversation_from_row(row) -> ConversationRecord:
+    return ConversationRecord(
+        conversation_id=str(row["conversation_id"]),
+        user_id=row["user_id"],
+        thread_id=row["thread_id"],
+        created_at=_iso(row["created_at"]),
+        last_turn_at=_iso(row["last_turn_at"]),
+        turn_count=row["turn_count"],
+    )
