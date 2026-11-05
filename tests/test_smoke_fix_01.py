@@ -15,7 +15,11 @@ de RAG-QUALITY-03 y "historia" queda temático).
 """
 
 from ada_study.contracts.documents import ChunkRecord
-from ada_study.graph.researcher import _is_ordinal_term, make_researcher_node
+from ada_study.graph.researcher import (
+    _is_ordinal_term,
+    _is_request_meta_term,
+    make_researcher_node,
+)
 from ada_study.index.bm25_index import BM25Index
 from ada_study.index.retriever import HybridRetriever
 from tests.test_study_endpoint import _document, _version
@@ -102,6 +106,28 @@ def test_ordinales_de_grado_clasificados():
         assert not _is_ordinal_term(term), term
 
 
+def test_vocabulario_meta_de_la_peticion_clasificado():
+    """RAG-RUNTIME-01b: el vocabulario de la PREGUNTA no acredita tema.
+
+    «temas» y «estudian» (de «¿Qué temas se estudian en Historia de quinto
+    grado?») tienen df=0 en el corpus: contaban como temáticos e inflaban
+    el umbral a coincidencias imposibles. Sí son meta: tema/temas, los
+    verbos de estudio/pedido y «información». Los temas reales siguen sin
+    serlo (y los interrogativos ya los filtra `significant_terms`).
+    """
+    for term in (
+        "temas", "tema", "estudian", "estudia", "estudiar", "información",
+        "informacion", "contiene", "quiero", "necesito", "busco", "tengas",
+        "habla", "trata", "podes", "decime", "disponible",
+    ):
+        assert _is_request_meta_term(term), term
+    for term in (
+        "historia", "mitosis", "fotosíntesis", "revolución", "fracciones",
+        "5to", "quinto", "1810",
+    ):
+        assert not _is_request_meta_term(term), term
+
+
 async def test_consulta_de_documento_con_ordinal_recupera_su_guia():
     """Caso SMOKE-FIX-01: «historia de quinto grado» recupera la guía.
 
@@ -138,6 +164,39 @@ async def test_consulta_con_ordinal_abreviado_recupera_su_guia():
     )
     details = decision["details"]
     assert details["ordinal_terms"] == ["5to"]
+    assert details["required_matches"] == 1
+
+
+async def test_pregunta_en_lenguaje_natural_recupera_su_guia():
+    """Regresión RAG-RUNTIME-01b: la pregunta natural recupera la guía.
+
+    Caso REAL de ejecución (traza Phoenix del 2026-11-05 01:12): «¿Qué temas
+    se estudian en Historia de quinto grado?» — el ordinal «quinto» ya se
+    detectaba, pero "temas" y "estudian" (df=0) contaban como temáticos:
+    umbral 2 imposible → los 5 fragmentos BM25 (4 de la guía pedida)
+    descartados → `insufficient_evidence`. Con el vocabulario meta de la
+    petición excluido, el umbral vuelve a las coincidencias alcanzables.
+    """
+    update = await make_researcher_node(_make_retriever(_corpus_guias()))(
+        {
+            "user_request": "¿Qué temas se estudian en Historia de quinto grado?",
+            "steps": 0,
+            "retries": 0,
+        }
+    )
+    artifact = update["research_artifact"]
+    assert artifact["evidence"], "la pregunta natural debe producir evidencia"
+    assert all(ref["document_id"] == "doc_hist" for ref in artifact["evidence"])
+    assert artifact["evidence_gaps"] == []
+    decision = next(
+        e for e in update["trace_events"] if e["event_type"] == "decision"
+    )
+    details = decision["details"]
+    assert details["ordinal_terms"] == ["quinto"]
+    assert details["request_meta_terms"] == ["estudian", "temas"]
+    assert "temas" not in details["target_terms"]
+    assert "estudian" not in details["target_terms"]
+    assert details["thematic_terms"] == ["historia"]
     assert details["required_matches"] == 1
 
 

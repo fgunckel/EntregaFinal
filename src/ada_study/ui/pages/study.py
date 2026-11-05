@@ -23,11 +23,16 @@ MAX_REQUEST_CHARS = 2000
 # Bandera de sesión para evitar envíos duplicados durante una petición.
 IN_FLIGHT_KEY = "ada_study_in_flight"
 
-# Conversación multi-turno (CHECKPOINTER-03): el identificador vive solo en
+# Conversación multi-turno (CHECKPOINTER-03): el identificador vive en
 # `st.session_state` y se envía en cada petición posterior mientras dure la
-# conversación. "Nueva conversación" simplemente lo descarta.
+# conversación. "Nueva conversación" simplemente lo descarta. FIX-TC06 §4.5:
+# además se refleja en `st.query_params` para que un F5 del navegador — que
+# reinicia `st.session_state` — NO inicie una conversación nueva: el
+# identificador vuelve del parámetro de URL y el backend verifica su
+# titularidad (404 → se descarta). "Nueva conversación" limpia el parámetro.
 CONVERSATION_KEY = "ada_study_conversation_id"
 TURNS_KEY = "ada_study_turns"
+CONVERSATION_PARAM = "conversacion"
 
 # Códigos de sesión vencida/inválida (frontera del backend, ADR-0005).
 SESSION_ERROR_CODES = {"AUTH_SESSION_INVALID", "AUTH_SESSION_EXPIRED"}
@@ -99,11 +104,31 @@ def register_turn(session_state, question: str, response: StudyResponse) -> None
     turns.append({"pregunta": question, "respuesta": response})
 
 
+def resolve_conversation_id(session_state, query_params) -> str | None:
+    """Conversación activa: sesión primero, query params como respaldo (§4.5).
+
+    Pura y testeable. Sobrevive a un F5 del navegador (nueva sesión de
+    Streamlit): el identificador vuelve del parámetro `?conversacion=…`.
+    La titularidad SIEMPRE la verifica el backend; un id ajeno/expirado
+    devuelve 404 y el llamador descarta ambos (sesión y parámetro).
+    """
+    conversation_id = session_state.get(CONVERSATION_KEY)
+    if conversation_id:
+        return conversation_id
+    restored = query_params.get(CONVERSATION_PARAM)
+    if not restored:
+        return None
+    session_state[CONVERSATION_KEY] = restored
+    return restored
+
+
 def _conversation_actions() -> None:
     """Acción del encabezado: iniciar una conversación nueva (CHECKPOINTER-03)."""
     if st.button("Nueva conversación", key="ada_new_conversation"):
         st.session_state.pop(CONVERSATION_KEY, None)
         st.session_state.pop(TURNS_KEY, None)
+        if CONVERSATION_PARAM in st.query_params:
+            del st.query_params[CONVERSATION_PARAM]
         st.rerun()
 
 
@@ -133,6 +158,8 @@ def _handle_submission(client, question: str, conversation_id: str | None) -> No
             # Conversación vencida/inválida: descartarla para permitir iniciar
             # una nueva en el próximo envío (el histórico vive en el backend).
             st.session_state.pop(CONVERSATION_KEY, None)
+            if CONVERSATION_PARAM in st.query_params:
+                del st.query_params[CONVERSATION_PARAM]
         return
     finally:
         # Limpia la bandera en todo camino (st.rerun lanza una excepción
@@ -143,6 +170,11 @@ def _handle_submission(client, question: str, conversation_id: str | None) -> No
     # cuando el backend devuelve conversation_id (conversaciones habilitadas);
     # el modo sin conversaciones no acumula historial ficticio.
     register_turn(st.session_state, question, response)
+    # FIX-TC06 §4.5: el identificador real también viaja en la URL para que
+    # un F5 o una reconexión recuperen la MISMA conversación (el backend
+    # verifica titularidad; nunca se confía en el parámetro sin validar).
+    if response.conversation_id:
+        st.query_params[CONVERSATION_PARAM] = response.conversation_id
 
     # El turno recién creado se muestra sin esperar un rerun: la conversación
     # se ve crecer inmediatamente (comportamiento de chat estándar).
@@ -161,7 +193,9 @@ def render_study() -> None:
 
     # Conversación en curso (CHECKPOINTER-03): mismo conversation_id en cada
     # petición mientras dure la conversación; ADA recuerda los turnos previos.
-    conversation_id = st.session_state.get(CONVERSATION_KEY)
+    # FIX-TC06 §4.5: un F5 (nueva sesión) restaura el identificador desde el
+    # parámetro de URL en lugar de iniciar una conversación nueva.
+    conversation_id = resolve_conversation_id(st.session_state, st.query_params)
 
     # st.chat_input se declara primero y se ancla al pie de la página;
     # `disabled` durante la petición previene el doble envío (mismo guard

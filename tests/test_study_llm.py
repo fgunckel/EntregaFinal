@@ -63,9 +63,12 @@ def _seeded_repo() -> FakeStudyRepository:
 def _client_with_model(repo: FakeStudyRepository, chat_model) -> TestClient:
     """App de pruebas con el chat model inyectado en AdaState (TASK-11)."""
     tmp_root = Path(tempfile.mkdtemp(prefix="ada_study_llm_"))
+    # `_env_file=None` (FIX-TC06): el fake no implementa conversaciones; el
+    # test debe ser hermético aunque el .env real habilite ADA_CONVERSATIONS.
     settings = Settings(
         database_url="postgresql+asyncpg://fake",
         ada_storage_dir=str(tmp_root),
+        _env_file=None,
     )
 
     def state_factory(resolved: Settings) -> AdaState:

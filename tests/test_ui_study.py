@@ -17,7 +17,12 @@ import pytest
 from ada_study.llm import LLM_FALLBACK_LIMITATION
 from ada_study.study import MAX_REQUEST_CHARS
 from ada_study.ui.api_client import ApiClient, ApiError
-from ada_study.ui.pages.study import describe_error, validation_error
+from ada_study.ui.pages.study import (
+    CONVERSATION_KEY,
+    describe_error,
+    resolve_conversation_id,
+    validation_error,
+)
 
 # Fakes y helpers reutilizados (patrón del proyecto: tests/test_api_auth).
 from tests.test_api_auth import _session_token, _user  # noqa: F401
@@ -224,5 +229,33 @@ class TestStudyPagePureHelpers:
     def test_now_is_utc(self):
         # Sanity del entorno de pruebas (imports compartidos de fakes).
         assert datetime.now(UTC).tzinfo is not None
+
+
+class TestResuelveConversacionId:
+    """FIX-TC06 §4.5: continuidad de la conversación ante F5/reconexión."""
+
+    def test_la_sesion_tiene_prioridad_sobre_el_parametro(self):
+        state = {CONVERSATION_KEY: "11111111-1111-1111-1111-111111111111"}
+        params = {"conversacion": "22222222-2222-2222-2222-222222222222"}
+        assert resolve_conversation_id(state, params) == (
+            "11111111-1111-1111-1111-111111111111"
+        )
+
+    def test_f5_restaura_desde_query_params(self):
+        # F5: nueva sesión de Streamlit → session_state vacío; el id vuelve
+        # del parámetro de URL y se vuelve a guardar en sesión.
+        state = {}
+        params = {"conversacion": "33333333-3333-3333-3333-333333333333"}
+        assert resolve_conversation_id(state, params) == (
+            "33333333-3333-3333-3333-333333333333"
+        )
+        assert state[CONVERSATION_KEY] == "33333333-3333-3333-3333-333333333333"
+
+    def test_sin_sesion_ni_parametro_retorna_none(self):
+        assert resolve_conversation_id({}, {}) is None
+
+    def test_parametro_vacio_no_restaura_nada(self):
+        assert resolve_conversation_id({}, {"conversacion": ""}) is None
+
 
 

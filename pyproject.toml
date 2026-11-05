@@ -45,6 +45,9 @@ observability = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+    "integration: requiere PostgreSQL real con el esquema aplicado (FIX-TC06); excluir con -m 'not integration'",
+]
 
 [tool.ruff]
 line-length = 100

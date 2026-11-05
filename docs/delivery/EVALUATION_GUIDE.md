@@ -337,6 +337,15 @@ documentación OpenAPI se sirve automáticamente en `/docs` (Swagger UI) y
   y los artefactos temporales se reinician por turno (`study/runtime.py`).
 - **Persistencia entre reinicios:** el estado vive en PostgreSQL (tablas del
   checkpointer), por lo que sobrevive a reinicios del proceso y del contenedor.
+- **Arranque en Windows (FIX-TC06):** psycopg (driver async del checkpointer)
+  exige `SelectorEventLoop`; uvicorn 0.54 solo lo elige con `--reload`. Para
+  arranques sin recarga usar `python run_api.py` (o `--no-reload`), que fuerza
+  el loop correcto; con Proactor, `CheckpointerPool.open()` corta el arranque
+  con `CHECKPOINTER_EVENT_LOOP` (fail-loud, sin cuelgues silenciosos).
+- **Continuidad en la UI (FIX-TC06 §4.5):** el `conversation_id` real viaja
+  también en `st.query_params` (`?conversacion=…`), de modo que un F5 del
+  navegador o una reconexión restauran la MISMA conversación (la titularidad
+  la verifica siempre el backend); «Nueva conversación» limpia el parámetro.
 - **Configuración:** `ADA_CONVERSATIONS_ENABLED=true` (default `false`, modo
   efímero por petición). Requiere `DATABASE_URL` accesible: con conversaciones
   habilitadas y base inaccesible, la API falla al arrancar (fail-loud). Los cambios

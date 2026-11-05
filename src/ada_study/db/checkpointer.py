@@ -67,6 +67,23 @@ class CheckpointerPool:
 
     async def open(self) -> None:
         """Abre el pool y ejecuta `setup()` (idempotente) del saver."""
+        # FIX-TC06: psycopg async no puede correr en el ProactorEventLoop
+        # default de Windows (exige SelectorEventLoop). Uvicorn solo elige
+        # Selector con `--reload`; en arranques sin reload (run_api.py lo
+        # configura) el pool fallaría en bucle silencioso. Fail-loud: un
+        # error claro corta el arranque en lugar de colgar el lifespan.
+        import asyncio
+        import sys
+
+        if sys.platform == "win32":
+            running = asyncio.get_running_loop()
+            if type(running).__name__ == "ProactorEventLoop":
+                raise CheckpointerError(
+                    "CHECKPOINTER_EVENT_LOOP",
+                    "El event loop de Windows es ProactorEventLoop, incompatible "
+                    "con psycopg async. Arrancá la API con `python run_api.py` "
+                    "(o con --reload, que selecciona SelectorEventLoop).",
+                )
         from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
         from psycopg_pool import AsyncConnectionPool
 

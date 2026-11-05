@@ -254,6 +254,71 @@ def _is_ordinal_term(term: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Vocabulario meta de la petición (RAG-RUNTIME-01b): misma clase estructural
+# que los ordinales de SMOKE-FIX-01.
+# ---------------------------------------------------------------------------
+# El defecto observado en ejecución real: «¿Qué temas se estudian en Historia
+# de quinto grado?» — "quinto" ya se detecta como ordinal, pero "temas" y
+# "estudian" (df=0: nunca aparecen en el corpus) contaban como temáticos e
+# inflaban el umbral min(2, |temáticos|) a 2 coincidencias ESTRUCTURALMENTE
+# imposibles: BM25 recuperaba los fragmentos correctos (4 de la guía pedida)
+# y el filtro los rechazaba a todos porque cada uno solo comparte "historia".
+# Son vocabulario de la PREGUNTA (qué se pide), no del CONTENIDO (qué se
+# aprende): cuando el corpus NO los contiene (df=0) inflan el umbral de
+# pertinencia a coincidencias imposibles y dejan de acreditar (ver el filtro
+# en `researcher_node`). Cuando SÍ aparecen en el corpus (df>0) pueden ser
+# contenido legítimo («La Historia estudia las sociedades humanas»,
+# RAG-QUALITY-03) y se rigen por la genericidad normal. La RECUPERACIÓN BM25
+# no cambia. Los interrogativos y palabras funcionales ya los cubre
+# `significant_terms` (bm25_index).
+_REQUEST_META_TERMS = frozenset(
+    _normalize(term)
+    for term in (
+        # Sustantivos meta de la petición
+        "tema", "subtema", "informacion", "info",
+        # Verbos de estudio / cobertura del material
+        "estudia", "estudian", "estudio", "estudias", "estudiar",
+        "aprende", "aprenden", "aprender", "aprendo",
+        "ensena", "ensenan", "ensenar",
+        "habla", "hablan", "hablar",
+        "trata", "tratan", "tratar",
+        "incluye", "incluyen", "incluir",
+        "contiene", "contienen", "contener",
+        "cubre", "cubren", "cubrir",
+        "abarca", "abarcan", "abarcar",
+        "menciona", "mencionan", "mencionar",
+        # Verbos de pedido / disposición (fuera de _CONTEXT_MARKERS)
+        "quiero", "quiere", "quieren", "querer",
+        "necesito", "necesita", "necesitan", "necesitar",
+        "busco", "busca", "buscan", "buscar",
+        "puedo", "podes", "puedes",
+        "decime", "dime", "decir",
+        "mostrame", "mostrar", "muestra",
+        "contame", "contar",
+        "pasame", "mandame",
+        "tengo", "tenes", "tienes", "tiene", "tienen", "tener", "tengas",
+        "disponible", "disponibles",
+    )
+)
+
+
+def _is_request_meta_term(term: str) -> bool:
+    """True si el término es vocabulario meta de la petición (pregunta/pedido).
+
+    Tolera plural simple (tema/temas), igual que `_term_matches`. Solo deja
+    de acreditar pertinencia cuando es estructuralmente inalcanzable (df=0,
+    ver `researcher_node`): con df>0 puede ser contenido legítimo.
+    """
+    base = _normalize(term).lower()
+    candidates = {base}
+    if base.endswith("es") and len(base) > 4:
+        candidates.add(base[:-2])
+    if base.endswith("s") and len(base) > 3:
+        candidates.add(base[:-1])
+    return bool(candidates & _REQUEST_META_TERMS)
+
+
+# ---------------------------------------------------------------------------
 # Restricciones de fuentes (RAG-QUALITY-05): clasificación de la consulta.
 # Los nombres de documentos y las restricciones de fuentes NUNCA acreditan
 # pertinencia temática: son metadatos del pedido, no contenido solicitado.
@@ -422,14 +487,39 @@ def make_researcher_node(retriever):
             ]
             target_terms = query_terms or fallback_terms
 
+        # RAG-RUNTIME-01b: el vocabulario meta de la petición («temas»,
+        # «estudian» en «¿Qué temas se estudian en Historia de quinto
+        # grado?») solo deja de acreditar cuando es ESTRUCTURALMENTE
+        # inalcanzable (df=0: ningún fragmento del corpus lo contiene; infla
+        # el umbral min(2, |temáticos|) sin poder coincidir jamás, el mismo
+        # falso negativo estructural que los ordinales en SMOKE-FIX-01). Con
+        # df>0 puede ser contenido legítimo («La Historia estudia las
+        # sociedades humanas», RAG-QUALITY-03): decide entonces la
+        # genericidad normal por frecuencia. La RECUPERACIÓN no cambia.
+        df_lookup = getattr(retriever, "term_document_frequency", None)
+        corpus_size = getattr(retriever, "indexed_chunk_count", lambda: 0)()
+        request_meta_terms: list[str] = []
+        if df_lookup is not None:
+            meta_inaccessible = [
+                term
+                for term in target_terms
+                if _is_request_meta_term(term) and not df_lookup(term)
+            ]
+            if meta_inaccessible:
+                request_meta_terms = meta_inaccessible
+                excluded = set(meta_inaccessible)
+                target_terms = [
+                    term for term in target_terms if term not in excluded
+                ]
+
         # Discriminación por frecuencia (RAG-QUALITY-03): los términos
         # genéricos (encabezados repetidos, restricciones de fuente, palabras
         # ubicuas) no acreditan pertinencia temática por sí solos. Sin
         # estadísticas disponibles (dobles de prueba) no hay descuento.
         thematic_terms, _generic_terms = _split_thematic_terms(
             target_terms,
-            getattr(retriever, "term_document_frequency", None),
-            getattr(retriever, "indexed_chunk_count", lambda: 0)(),
+            df_lookup,
+            corpus_size,
         )
 
         relevant: list = []
@@ -439,7 +529,24 @@ def make_researcher_node(retriever):
             # Coincidencia exigida sobre términos TEMÁTICOS; solo si la
             # consulta no tiene ninguno (todos ubicuos en el corpus) se
             # conserva el umbral original sobre los términos objetivo.
-            evidence_terms = thematic_terms or target_terms
+            # RAG-RUNTIME-01b: el vocabulario meta de la petición («temas»,
+            # «estudian») ni FIJA el umbral ni ACREDITA cuando hay términos
+            # temáticos reales que lo hagan (no DEMANDA coincidencias que los
+            # fragmentos pertinentes no comparten, y no valida fragmentos que
+            # solo comparten vocabulario de la pregunta). Con df>0 un término
+            # meta puede ser contenido legítimo («La Historia estudia las
+            # sociedades», RAG-QUALITY-03): ahí decide la genericidad normal.
+            # Si los únicos temáticos son meta (no hay mejor criterio) o no
+            # hay temáticos (anti falso negativo), se conserva el umbral
+            # original.
+            if thematic_terms:
+                evidence_terms = [
+                    term
+                    for term in thematic_terms
+                    if not _is_request_meta_term(term)
+                ] or thematic_terms
+            else:
+                evidence_terms = target_terms
             required = min(2, len(evidence_terms))
             # Espejo del indexado BM25 (`title + text`): el tema del turno
             # previo suele vivir en el título del fragmento (multi-turno).
@@ -514,6 +621,7 @@ def make_researcher_node(retriever):
                 "thematic_terms": list(thematic_terms),
                 "source_restriction_terms": sorted(restriction_terms),
                 "ordinal_terms": sorted(ordinal_terms),
+                "request_meta_terms": sorted(request_meta_terms),
                 "required_matches": required,
             },
         )
