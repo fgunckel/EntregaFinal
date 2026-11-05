@@ -100,3 +100,54 @@ def test_rebuild_from_persisted_chunks():
     index = BM25Index.rebuild(chunks_v1 + chunks_v2)
     assert index.indexed_versions() == {"v1", "v2"}
     assert index.search("maulla")[0][0] == "v1:0"
+
+
+# ---------------------------------------------------------------------------
+# Matching léxico en español (RAG-QUALITY-01, D-2)
+# ---------------------------------------------------------------------------
+
+
+def test_stopwords_do_not_dominate_results():
+    """Las palabras funcionales no generan coincidencias por sí solas."""
+    index = BM25Index()
+    index.add_version([_chunk("v1", "la de el que las en por para un una")])
+    index.add_version([_chunk("v2", "fotosintesis ocurre en cloroplastos")])
+    # Consulta de solo palabras funcionales: sin coincidencias significativas.
+    assert index.search("de la que el en un una") == []
+    # Los términos significativos siguen decidiendo; "la"/"en" no puntúan.
+    results = index.search("la fotosintesis en el cloroplasto", top_k=2)
+    assert [chunk_id for chunk_id, _ in results] == ["v2:0"]
+
+
+def test_query_without_significant_matches_returns_empty():
+    """Sin coincidencias significativas no hay evidencia aparente."""
+    index = BM25Index()
+    index.add_version([_chunk("v1", "la mitocondria produce energia")])
+    # Solo stopwords en la consulta → vacío (no usa términos del corpus).
+    assert index.search("de la que") == []
+    # Términos significativos ausentes del corpus → vacío.
+    assert index.search("fotosintesis cloroplastos") == []
+
+
+def test_academic_terms_and_numbers_still_retrieved():
+    """Números y términos académicos se conservan en la recuperación."""
+    index = BM25Index()
+    index.add_version(
+        [_chunk("v1", "La Revolución de Mayo de 1810 se dio en Buenos Aires")]
+    )
+    results = index.search("revolución 1810", top_k=1)
+    assert results
+    assert results[0][0] == "v1:0"
+    assert results[0][1] > 0
+
+
+def test_scores_order_preserved_descending():
+    """Los scores decaen con el ranking y el orden se conserva estable."""
+    index = BM25Index()
+    index.add_version([_chunk("v1", "mitocondria mitocondria energia")])
+    index.add_version([_chunk("v2", "mitocondria")])
+    results = index.search("mitocondria energia", top_k=2)
+    assert len(results) == 2
+    scores = [score for _, score in results]
+    assert scores == sorted(scores, reverse=True)
+    assert scores[0] > 0

@@ -1,7 +1,0 @@
-﻿TOTAL eventos: 8
---- accion | entity_type | entity_id | cantidad ---
-  account.activated | user | usr_3674f5e31077 | 1
-  auth.login | user | usr_3674f5e31077 | 1
-  auth.login | user | usr_86123da82670 | 5
-  invitation.create | invitation | inv_56834def50a4 | 1
-Eventos con entity_id=doc_b9d9f675e861: 0

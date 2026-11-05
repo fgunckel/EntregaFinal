@@ -141,6 +141,16 @@ class HybridRetriever:
         """
         self._chunk_by_id = {chunk.chunk_id: chunk for chunk in chunks}
 
+    # -- estadísticas del corpus (RAG-QUALITY-03) -------------------------------
+
+    def term_document_frequency(self, term: str) -> int:
+        """Cantidad de chunks indexados que contienen el término (df)."""
+        return self._bm25.document_frequency(term)
+
+    def indexed_chunk_count(self) -> int:
+        """Cantidad total de chunks indexados (N del corpus)."""
+        return self._bm25.chunk_count()
+
     # -- verificación de visibilidad (capa 2, contra el catálogo) -------------
 
     async def _is_visible(self, chunk: ChunkRecord) -> bool:

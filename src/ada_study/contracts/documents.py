@@ -93,6 +93,19 @@ class DocumentRecord(StrictModel):
     deleted_at: str | None = None
 
 
+class SubmitForReviewResponse(StrictModel):
+    """Respuesta del envío a revisión del autor (PUBLISH-FLOW-02).
+
+    Contrato Pydantic del endpoint `POST /api/documents/{id}/submit`:
+    identifica el documento, su versión activa y la transición aplicada.
+    """
+
+    document_id: str
+    active_version_id: str
+    previous_status: EditorialStatus
+    editorial_status: EditorialStatus
+
+
 class DocumentVersion(StrictModel):
     """Versión inmutable de un documento (tabla `document_versions`)."""
 

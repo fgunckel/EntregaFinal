@@ -111,6 +111,31 @@ class ApiClient:
             )
         return response.json()
 
+    def _parse_json_list(
+        self, response: httpx.Response, *, key: str, endpoint: str
+    ) -> list:
+        """Valida el envelope de un listado y devuelve la lista (UI-ROBUSTNESS-01).
+
+        El contrato exige un diccionario con la clave esperada y su valor
+        de tipo lista. Un envelope inesperado (payload no dict, clave
+        ausente, clave alternativa o valor que no es lista) se convierte
+        en `ApiError` con código estable `INVALID_RESPONSE_ENVELOPE` en
+        vez de propagar un `KeyError` crudo a Streamlit. Sin fallbacks
+        silenciosos: un cambio de contrato se hace visible.
+        """
+        payload = self._parse_json(response)
+        if (
+            not isinstance(payload, dict)
+            or key not in payload
+            or not isinstance(payload[key], list)
+        ):
+            raise ApiError(
+                "INVALID_RESPONSE_ENVELOPE",
+                f"Respuesta con formato inesperado de la API ({endpoint}).",
+                response.status_code,
+            )
+        return payload[key]
+
     # -- identidad (B1/B3) --------------------------------------------------------
 
     def login(self, email: str, password: str) -> str:
@@ -140,8 +165,10 @@ class ApiClient:
 
     def list_documents(self) -> list[DocumentRecord]:
         """GET /api/documents: biblioteca visible según rol (Spec 06 §106)."""
-        payload = self._parse_json(self._call("GET", "/api/documents"))
-        return [DocumentRecord.model_validate(item) for item in payload["documents"]]
+        items = self._parse_json_list(
+            self._call("GET", "/api/documents"), key="documents", endpoint="/api/documents"
+        )
+        return [DocumentRecord.model_validate(item) for item in items]
 
     def get_document(self, document_id: str) -> DocumentRecord:
         """GET /api/documents/{id}: detalle con autorización por ID."""
@@ -155,17 +182,21 @@ class ApiClient:
 
     # -- estudio (TASK-12) ---------------------------------------------------------
 
-    def study(self, user_request: str) -> StudyResponse:
+    def study(self, user_request: str, conversation_id: str | None = None) -> StudyResponse:
         """POST /api/study: respuesta de estudio con evidencia verificada.
 
-        Envía SOLO `user_request`: identidad/permisos los resuelve el backend
-        con el token de sesión; la UI nunca envía roles, usuarios ni claves
-        de proveedores (el modo LLM lo decide el backend, TASK-11).
+        Envía SOLO `user_request` + `conversation_id` (CHECKPOINTER-03): la
+        identidad/permisos los resuelve el backend con el token de sesión; la
+        UI nunca envía roles, usuarios, thread_id ni claves de proveedores.
+        Con `conversation_id` se continúa la conversación (mismo identificador
+        en cada petición posterior); None inicia una conversación nueva (el
+        UUID lo genera el servidor y llega en la respuesta).
         Valida la salida con el contrato real `StudyResponse`.
         """
-        payload = self._request_json(
-            "POST", "/api/study", json_body={"user_request": user_request}
-        )
+        body: dict[str, str] = {"user_request": user_request}
+        if conversation_id:
+            body["conversation_id"] = conversation_id
+        payload = self._request_json("POST", "/api/study", json_body=body)
         return StudyResponse.model_validate(payload)
 
     def upload_document(
@@ -205,12 +236,27 @@ class ApiClient:
             self._call("POST", f"/api/documents/{document_id}/versions/{version_id}/retry")
         )
 
+    def submit_for_review(self, document_id: str) -> dict:
+        """POST /api/documents/{id}/submit: envío del autor a revisión.
+
+        PUBLISH-FLOW-02: draft -> pending_review. Solo el autor puede (403
+        si no); 404 si no existe/no es visible; 409 si no está en draft o la
+        versión activa no está `available`. No publica directamente (ADR-0005).
+        """
+        return self._parse_json(
+            self._call("POST", f"/api/documents/{document_id}/submit")
+        )
+
     # -- moderación y auditoría (rol) -----------------------------------------------
 
     def moderation_queue(self) -> list[DocumentRecord]:
         """GET /api/moderation/queue: pendientes de decisión (moderator/admin)."""
-        payload = self._parse_json(self._call("GET", "/api/moderation/queue"))
-        return [DocumentRecord.model_validate(item) for item in payload["queue"]]
+        items = self._parse_json_list(
+            self._call("GET", "/api/moderation/queue"),
+            key="queue",
+            endpoint="/api/moderation/queue",
+        )
+        return [DocumentRecord.model_validate(item) for item in items]
 
     def decide(self, document_id: str, action: str, reason: str | None = None) -> dict:
         """POST /api/moderation/documents/{id}/decide.
@@ -237,8 +283,12 @@ class ApiClient:
         if entity_type and entity_id:
             params["entity_type"] = entity_type
             params["entity_id"] = entity_id
-        payload = self._parse_json(self._call("GET", "/api/audit/events", params=params))
-        return [AuditEvent.model_validate(item) for item in payload["events"]]
+        items = self._parse_json_list(
+            self._call("GET", "/api/audit/events", params=params),
+            key="events",
+            endpoint="/api/audit/events",
+        )
+        return [AuditEvent.model_validate(item) for item in items]
 
     # -- helpers privados -------------------------------------------------------------
 

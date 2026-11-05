@@ -4,6 +4,8 @@ Endpoints:
 - POST /api/documents          → 202 Accepted (encola; no ingesta en línea)
 - GET  /api/documents          → listado con visibilidad según rol
 - GET  /api/documents/{id}     → detalle con autorización por ID
+- POST /api/documents/{id}/submit → envío del autor: draft -> pending_review
+  (PUBLISH-FLOW-02; ruta de AUTORÍA, sin publicación directa)
 - GET  /api/ingestion-jobs/{job_id} → polling del job con autorización
 
 Reglas aplicadas:
@@ -21,6 +23,7 @@ from fastapi.responses import JSONResponse
 
 from ada_study.api.dependencies import get_current_user
 from ada_study.config import Settings
+from ada_study.contracts.documents import SubmitForReviewResponse
 from ada_study.contracts.identity import UserRecord
 from ada_study.db.repository import (
     CatalogError,
@@ -264,6 +267,86 @@ async def get_ingestion_job(
         )
 
     return JSONResponse(status_code=200, content=job.model_dump())
+
+
+# ---------------------------------------------------------------------------
+# PUBLISH-FLOW-02: envío del autor a revisión (draft -> pending_review)
+# ---------------------------------------------------------------------------
+
+
+@router.post("/documents/{document_id}/submit")
+async def submit_for_review(
+    document_id: str,
+    request: Request,
+    user: Annotated[UserRecord, Depends(get_current_user)],
+):
+    """Envío del AUTOR: draft -> pending_review (PUBLISH-FLOW-02, Spec 06 §46-55).
+
+    - Ruta de AUTORÍA: solo el propietario puede enviar su propio documento.
+      Moderator/admin NO pueden enviar ajenos: las reglas de autoría vigentes
+      (AUTHOR_TRANSITIONS en `permissions.py`) no autorizan a terceros hacia
+      `pending_review`, así que no se abre esa ruta.
+    - La identidad SIEMPRE deriva de la sesión autenticada (get_current_user):
+      nunca de identificadores o roles enviados por el cliente.
+    - Reutiliza CatalogService + state_rules (ADR-0005) + auditoría
+      append-only. NO publica: `draft -> published` sigue inválida; la única
+      vía de publicación es la Moderación existente (`decide` approve).
+    - Errores: 404 (inexistente / no visible / cortina de borrado), 403
+      (sin autoría), 409 (estado no-draft o versión no `available`).
+    """
+    from ada_study.domain import permissions
+
+    if not permissions.has_permission(user.role, "documents:upload"):
+        raise ForbiddenError("documents:upload")
+
+    try:
+        document = await _catalog(request).get_document(document_id)
+    except NotFoundError as exc:
+        return JSONResponse(
+            status_code=404,
+            content=_error_payload("DEL_NOT_FOUND", str(exc)),
+        )
+    if not _can_see_document(user, document) or document.editorial_status == "deleted":
+        # 404 (no 403): no se revela la existencia del recurso (Spec 06 §41).
+        # La cortina editorial también aplica al propio autor (Spec 05 esc. 5).
+        return JSONResponse(
+            status_code=404,
+            content=_error_payload("DEL_NOT_FOUND", f"Documento {document_id} no existe"),
+        )
+    if document.uploaded_by != user.user_id:
+        return JSONResponse(
+            status_code=403,
+            content=_error_payload(
+                "DEL_NOT_ALLOWED",
+                "Solo el autor puede enviar su documento a revisión",
+            ),
+        )
+
+    previous_status = document.editorial_status
+    try:
+        updated = await _catalog(request).submit_for_review(
+            document_id=document_id, actor_id=user.user_id
+        )
+    except NotFoundError as exc:
+        return JSONResponse(
+            status_code=404,
+            content=_error_payload("DEL_NOT_FOUND", str(exc)),
+        )
+    except InvalidTransitionError as exc:
+        # Códigos estables: MOD_INVALID_TRANSITION (editorial) o DEL_CONFLICT
+        # (versión no available) — ambos 409 según ERROR_STATUS.
+        return JSONResponse(
+            status_code=ERROR_STATUS.get(exc.error_code, 409),
+            content=_error_payload(exc.error_code, str(exc)),
+        )
+
+    response = SubmitForReviewResponse(
+        document_id=updated.document_id,
+        active_version_id=updated.active_version_id or "",
+        previous_status=previous_status,
+        editorial_status=updated.editorial_status,
+    )
+    return JSONResponse(status_code=200, content=response.model_dump())
 
 
 # ---------------------------------------------------------------------------

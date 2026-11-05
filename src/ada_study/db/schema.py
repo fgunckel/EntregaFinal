@@ -19,6 +19,7 @@ from sqlalchemy import (
     func,
     text,
 )
+from sqlalchemy.dialects.postgresql import UUID as PGUUID
 
 metadata = MetaData()
 
@@ -269,3 +270,23 @@ audit_events = Table(
 
 Index("ix_audit_entity", audit_events.c.entity_type, audit_events.c.entity_id)
 Index("ix_audit_created", audit_events.c.created_at)
+
+# Conversaciones multi-turno (CHECKPOINTER-02/03). Una conversación agrupa
+# los turnos de estudio de UN alumno; el `thread_id` del checkpointer se
+# deriva del `conversation_id` (nunca lo elige el cliente). La tabla vive en
+# la misma base del catálogo (ADR-0001: PostgreSQL única fuente de estado);
+# las tablas de checkpoint (checkpoints/checkpoint_blobs/...) son gestionadas
+# por `AsyncPostgresSaver.setup()`, no por este esquema.
+conversations = Table(
+    "conversations",
+    metadata,
+    Column("conversation_id", PGUUID(as_uuid=True), primary_key=True),
+    Column("user_id", String(64), nullable=False),
+    Column("thread_id", String(128), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    Column("last_turn_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    Column("turn_count", Integer, nullable=False, server_default="0"),
+)
+
+Index("ux_conversations_thread_id", conversations.c.thread_id, unique=True)
+Index("ix_conversations_user", conversations.c.user_id)

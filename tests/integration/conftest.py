@@ -31,8 +31,22 @@ from ada_study.storage.pdf_storage import PdfStorage
 
 @pytest.fixture(scope="session")
 def database_url() -> str:
-    """URL de PostgreSQL real; SKIP sin DATABASE_URL (nada de fakes)."""
-    url = os.environ.get("DATABASE_URL", "").strip()
+    """URL de PostgreSQL del proyecto; SKIP sin DATABASE_URL (nada de fakes).
+
+    Hermético: se resuelve desde la configuración del repo (pydantic-settings,
+    archivo `.env`), ignorando cualquier `DATABASE_URL` ambiental de la sesión
+    que pueda apuntar a credenciales ajenas al proyecto. Nunca se modifican
+    credenciales: la base configurada solo se usa para crear/borrar una base
+    EFÍMERA de test; su contenido no se toca.
+    """
+    from ada_study.config import Settings
+
+    saved = os.environ.pop("DATABASE_URL", None)
+    try:
+        url = Settings().database_url.strip()
+    finally:
+        if saved is not None:
+            os.environ["DATABASE_URL"] = saved
     if not url:
         pytest.skip("DATABASE_URL no definida: se requiere PostgreSQL real (docker compose up -d)")
     return url

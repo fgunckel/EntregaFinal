@@ -16,6 +16,7 @@ from typing import Literal
 
 from pydantic import Field
 
+from ada_study.contracts.trace import Trace
 from ada_study.strict_model import StrictModel
 
 # ---------------------------------------------------------------------------
@@ -122,7 +123,18 @@ class PracticeSet(StrictModel):
 
 
 class StudyResponse(StrictModel):
-    """Respuesta estructurada de estudio (reemplaza `FinalReport.recommendation`)."""
+    """Respuesta estructurada de estudio (reemplaza `FinalReport.recommendation`).
+
+    Semántica de estados (RAG-QUALITY-01):
+    - `complete`: la explicación está respaldada por evidencia PERTINENTE
+      recuperada del corpus (coincidencia de términos significativos) y en
+      cantidad suficiente (≥ 2 fragmentos, o el único fragmento con el aviso
+      de cantidad en `evidence_gaps`).
+    - `insufficient_evidence`: la biblioteca no contiene material con
+      relación pertinente suficiente para la consulta; no se inventa
+      contenido ni citas y `evidence_gaps` explica el motivo.
+    La decisión es determinística (researcher/tutor); el LLM no la altera.
+    """
 
     status: StudyResponseStatus = "complete"
     topic: str = Field(min_length=1)
@@ -134,3 +146,13 @@ class StudyResponse(StrictModel):
     # Insuficiencia reconocida explícitamente (Spec 00/03/04)
     evidence_gaps: list[str] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
+    # Conversación multi-turno (CHECKPOINTER-02): UUID generado por el
+    # servidor; el endpoint lo completa SIEMPRE (nueva o reutilizada). El
+    # dominio pedagógico no lo usa: es metadato del turno.
+    conversation_id: str | None = None
+    # Trazabilidad estructurada de la ejecución (AGENT-TRACE-01): eventos
+    # reales de los nodos y de la llamada al LLM. None (default) cuando la
+    # respuesta se construye dentro del grafo; el runtime la adjunta al
+    # finalizar. Aditivo y retrocompatible: clientes viejos lo ignoran y
+    # clientes nuevos reciben None cuando no hay traza.
+    trace: Trace | None = None

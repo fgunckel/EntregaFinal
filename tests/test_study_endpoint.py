@@ -131,6 +131,7 @@ def _client(repository: FakeStudyRepository) -> TestClient:
     settings = Settings(
         database_url="postgresql+asyncpg://fake",
         ada_storage_dir=str(tmp_root),
+        _env_file=None,
     )
 
     def state_factory(resolved: Settings) -> AdaState:
@@ -403,6 +404,61 @@ class TestStudyEndpoint:
         payload = response.json()
         assert payload["status"] in {"insufficient_evidence", "limited"}
         assert payload["references"] == []
+
+
+# ---------------------------------------------------------------------------
+# RAG-QUALITY-01: relevancia de evidencia (integración del flujo Study)
+# ---------------------------------------------------------------------------
+
+
+class TestRelevanciaEvidencia:
+    """Reproduce el defecto observado: consulta de Historia con corpus que
+    contiene Historia pertinente y Matemática con coincidencias léxicas
+    genéricas. Matemática no puede aceptarse como evidencia suficiente."""
+
+    QUERY = (
+        "Según el documento de Historia, ¿cuáles fueron las causas de la "
+        "Revolución de Mayo?"
+    )
+    HISTORIA_1 = (
+        "Las causas de la Revolución de Mayo fueron la invasión napoleónica "
+        "de España y la cautividad del rey."
+    )
+    HISTORIA_2 = (
+        "La Revolución de Mayo de 1810 instituyó la Primera Junta de gobierno "
+        "en Buenos Aires."
+    )
+    MATEMATICA = (
+        "Documento de Matemática de quinto grado: las fracciones representan "
+        "las partes iguales de un todo dividido."
+    )
+
+    def _viewer(self) -> ViewerContext:
+        return ViewerContext(user_id="usr_1", role="student")
+
+    async def test_historia_query_supported_by_historia_evidence(self):
+        """Consulta de Historia + evidencia pertinente de Historia → complete,
+        con referencias SOLO del documento de Historia."""
+        repo = FakeStudyRepository()
+        _seed_published_document(repo, "doc_hist", "autor", self.HISTORIA_1)
+        repo.chunks["ver_doc_hist"].append(
+            _chunk("doc_hist", self.HISTORIA_2, page=2, index=1)
+        )
+        _seed_published_document(repo, "doc_mat", "autor", self.MATEMATICA)
+        response = await run_study(repo, self.QUERY, self._viewer())
+        assert response.status == "complete"
+        assert response.references
+        assert {ref.document_id for ref in response.references} == {"doc_hist"}
+
+    async def test_math_only_corpus_is_insufficient_for_historia_query(self):
+        """Consulta de Historia + solo evidencia de Matemática (coincidencia
+        léxica genérica por 'documento') → insufficient_evidence."""
+        repo = FakeStudyRepository()
+        _seed_published_document(repo, "doc_mat", "autor", self.MATEMATICA)
+        response = await run_study(repo, self.QUERY, self._viewer())
+        assert response.status == "insufficient_evidence"
+        assert response.references == []
+        assert response.evidence_gaps
 
 
 # ---------------------------------------------------------------------------

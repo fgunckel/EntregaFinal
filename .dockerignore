@@ -1,0 +1,18 @@
+# Contexto mínimo de build: solo pyproject + README + src (la imagen nunca
+# contiene .env, secretos, entornos virtuales ni material de entrega).
+.git
+.venv
+.coda
+.ada_storage
+**/__pycache__
+**/*.py[cod]
+.pytest_cache
+.ruff_cache
+.env
+.env.*
+!.env.example
+tests
+Entrega7
+Entregas
+docker-compose.yml
+Dockerfile

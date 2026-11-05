@@ -7,6 +7,8 @@
   cliente ni mantiene identidad propia.
 """
 
+import os
+
 from ada_study.ui.api_client import ApiClient
 
 SESSION_TOKEN_KEY = "ada_session_token"
@@ -14,7 +16,9 @@ SESSION_USER_KEY = "ada_session_user"
 SESSION_BASE_URL_KEY = "ada_api_base_url"
 
 # Base URL por defecto de la API (despliegue local, README §instalación).
-DEFAULT_BASE_URL = "http://localhost:8000"
+# Configurable por entorno para despliegues en contenedor (FINAL-02): en
+# Compose la UI llama al servicio `api` por la red interna del proyecto.
+DEFAULT_BASE_URL = os.environ.get("ADA_API_BASE_URL", "http://localhost:8000")
 
 
 def get_base_url() -> str:

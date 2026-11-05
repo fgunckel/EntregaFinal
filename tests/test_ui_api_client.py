@@ -185,6 +185,7 @@ def _build_app(repository):
     settings = Settings(
         database_url="postgresql+asyncpg://fake",
         ada_storage_dir=str(tmp_root),
+        _env_file=None,
     )
 
     def state_factory(resolved: Settings) -> AdaState:

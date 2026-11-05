@@ -9,6 +9,7 @@
   vía `IdentityService.validate_session`. Sin bypass ni identidad fija.
 """
 
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -30,6 +31,7 @@ class AdaState:
         repository: CatalogRepository,
         storage: PdfStorage,
         chat_model=None,
+        checkpointer=None,
     ) -> None:
         self.engine = engine
         self.repository = repository
@@ -39,6 +41,15 @@ class AdaState:
         # Chat model del tutor (TASK-11): construido UNA VEZ por proceso.
         # None = modo determinístico (default seguro, sin llamadas ni costos).
         self.chat_model = chat_model
+        # Checkpointer LangGraph (CHECKPOINTER-01): None = modo efímero
+        # (conversaciones deshabilitadas); AsyncPostgresSaver si está habilitado.
+        self.checkpointer = checkpointer
+        # Locks por conversación (CHECKPOINTER-03, §8): serializa turnos de la
+        # MISMA conversación dentro del proceso; conversaciones distintas no se
+        # bloquean entre sí. Sin infraestructura distribuida: un diccionario
+        # por app (la mutación es atómica en el event loop, sin `await` entre
+        # la lectura y la asignación).
+        self.conversation_locks: dict[str, asyncio.Lock] = {}
 
 
 def create_app(
@@ -75,17 +86,40 @@ def create_app(
         engine = create_async_engine(resolved.database_url, echo=False)
         repository = CatalogRepository(engine=engine)
         storage = PdfStorage(root=resolved.ada_storage_dir)
-        # Fail-fast (TASK-11): una configuración LLM inválida (proveedor
-        # desconocido, modelo o clave ausentes) corta el arranque, nunca una
-        # petición. Con ADA_LLM_PROVIDER=none (default) el modelo es None.
-        app.state.ada = AdaState(
-            engine=engine,
-            repository=repository,
-            storage=storage,
-            chat_model=build_chat_model(resolved),
-        )
-        yield
-        await engine.dispose()
+        # Checkpointer persistente (CHECKPOINTER-01): solo con
+        # ADA_CONVERSATIONS_ENABLED=true. Fallos de conexión cortan el
+        # arranque de forma ruidosa (fail-loud, sin degradar a efímero).
+        checkpointer_pool = None
+        if resolved.ada_conversations_enabled:
+            from ada_study.db.checkpointer import CheckpointerPool
+
+            checkpointer_pool = CheckpointerPool(resolved.database_url)
+            await checkpointer_pool.open()
+        # Observabilidad técnica (AGENT-TRACE-01 §6): OTel/OpenInference hacia
+        # Phoenix, con instrumentación LangChain real (spans por nodo y por
+        # llamada LLM). Configurada sin el extra instalado corta el arranque
+        # (ImportError fail-loud, igual que el checkpointer); fallos de
+        # exportación posteriores los reporta OTel en logs sin tumbar la API.
+        if resolved.ada_phoenix_enabled:
+            from ada_study.observability.phoenix import init_phoenix
+
+            init_phoenix(resolved)
+        try:
+            # Fail-fast (TASK-11): una configuración LLM inválida (proveedor
+            # desconocido, modelo o clave ausentes) corta el arranque, nunca una
+            # petición. Con ADA_LLM_PROVIDER=none (default) el modelo es None.
+            app.state.ada = AdaState(
+                engine=engine,
+                repository=repository,
+                storage=storage,
+                chat_model=build_chat_model(resolved),
+                checkpointer=checkpointer_pool.checkpointer if checkpointer_pool else None,
+            )
+            yield
+        finally:
+            if checkpointer_pool is not None:
+                await checkpointer_pool.close()
+            await engine.dispose()
 
     app = FastAPI(title="ADA Study API", version="0.1.0", lifespan=lifespan)
     app.state.settings = resolved

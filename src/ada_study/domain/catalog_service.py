@@ -19,6 +19,7 @@ from ada_study.contracts.documents import (
     IngestionJob,
     PendingIndexOp,
 )
+from ada_study.contracts.identity import AuditEvent
 from ada_study.db.repository import (
     CatalogRepository,
     DuplicateDocumentError,
@@ -296,6 +297,52 @@ class CatalogService:
 
     async def get_version(self, version_id: str) -> DocumentVersion:
         return await self._repo.get_version(version_id)
+
+    async def submit_for_review(
+        self, *, document_id: str, actor_id: str
+    ) -> DocumentRecord:
+        """Envío del AUTOR a revisión: draft -> pending_review (PUBLISH-FLOW-02).
+
+        - Ruta de AUTORÍA: la propiedad la valida el endpoint a partir de la
+          sesión autenticada (nunca de identificadores del cliente); este
+          servicio valida estado y versión, sin revalidar permisos.
+        - Alcance limitado a `draft`: ninguna otra transición editorial pasa
+          por aquí. ADR-0005 se mantiene intacto: `draft -> published` sigue
+          siendo inválida (la validación real la aplica
+          `update_editorial_status` contra `state_rules`, no se duplica).
+        - Requiere versión activa existente y `available` (misma exigencia
+          que la recuperación: `is_version_recoverable`).
+        - Registra UN evento de auditoría append-only (Spec 06 §81-88) con
+          actor, documento, versión, estado anterior y nuevo, fecha y acción.
+        """
+        document = await self._repo.get_document(document_id)
+        if document.editorial_status != "draft":
+            raise InvalidTransitionError(
+                "editorial", document.editorial_status, "pending_review"
+            )
+        if document.active_version_id is None:
+            raise InvalidTransitionError("version", "missing", "available")
+        version = await self._repo.get_version(document.active_version_id)
+        if version.status != "available":
+            raise InvalidTransitionError("version", version.status, "available")
+
+        previous_status = document.editorial_status
+        await self._repo.update_editorial_status(document_id, "pending_review")
+        updated = await self._repo.get_document(document_id)
+        await self._repo.append_audit_event(
+            AuditEvent(
+                event_id=_new_id("evt"),
+                actor_id=actor_id,
+                action="document.submit_for_review",
+                entity_type="document",
+                entity_id=document_id,
+                version_id=document.active_version_id,
+                result="ok",
+                reason=f"editorial: {previous_status} -> pending_review",
+                created_at=_now_iso(),
+            )
+        )
+        return updated
 
     async def get_job(self, job_id: str) -> IngestionJob:
         return await self._repo.get_job(job_id)
