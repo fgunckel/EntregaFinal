@@ -1,7 +1,12 @@
-# PostgreSQL 16 para ADA Study (ADR-0001: única fuente de estado).
-# Uso: docker compose up -d
-# La base se crea vacía; el esquema se aplica con:
-#   python -m ada_study.db.create_schema "$DATABASE_URL"
+# ADA Study — despliegue local reproducible (FINAL-02).
+# Uso único: docker compose up --build
+#   - PostgreSQL 16 (ADR-0001) con volumen persistente y healthcheck.
+#   - Phoenix 21 (AGENT-TRACE-01 §6): UI de trazas en http://localhost:6006.
+#   - migrate: one-shot idempotente (python -m ada_study.db.create_schema).
+#   - api / worker / ui: imagen única ada-study-app, distintos comandos.
+# La base se inicializa sola; el admin inicial se crea con:
+#   docker compose run --rm api python -m ada_study.cli \
+#     postgresql+asyncpg://ada:ada_dev_password@postgres:5432/ada_study
 services:
   postgres:
     image: postgres:16-alpine
@@ -19,17 +24,108 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    restart: unless-stopped
 
   # Phoenix (AGENT-TRACE-01 §6): UI de trazas técnicas en http://localhost:6006.
-  # Opcional: levantar solo con `docker compose up -d phoenix`. La app exporta
-  # spans vía OTLP hacia http://localhost:6006/v1/traces cuando
-  # ADA_PHOENIX_ENABLED=true (endpoint: el que expone el colector de Phoenix).
+  # Phoenix 21 exige autenticación (Bearer) para la INGESTA por defecto
+  # (verificado: POST /v1/traces -> 401). Para el entorno LOCAL de desarrollo
+  # se fija explícitamente la configuración soportada sin auth; ver README
+  # (§Observabilidad) para la variante con autenticación (PHOENIX_SECRET +
+  # API key en el header del exportador OTLP).
   phoenix:
     image: arizephoenix/phoenix:latest
     container_name: ada_study_phoenix
+    environment:
+      PHOENIX_ENABLE_AUTH: "false"
     ports:
       - "6006:6006"
+    restart: unless-stopped
+
+  # One-shot: inicialización idempotente del esquema (create_all + migración
+  # rev. 3 idempotente). Re-ejecutable sin dañar datos.
+  migrate:
+    image: ada-study-app:latest
+    build: .
+    command: sh -c 'python -m ada_study.db.create_schema "$$DATABASE_URL"'
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgresql+asyncpg://ada:ada_dev_password@postgres:5432/ada_study
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # API FastAPI mediante la factory existente (create_app), puerto 8000.
+  api:
+    image: ada-study-app:latest
+    container_name: ada_study_api
+    command: uvicorn ada_study.api.app:create_app --factory --host 0.0.0.0 --port 8000
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # Red interna del proyecto: la BD es `postgres`, no localhost.
+      DATABASE_URL: postgresql+asyncpg://ada:ada_dev_password@postgres:5432/ada_study
+      # Almacén de PDF compartido con el worker (volumen común).
+      ADA_STORAGE_DIR: /data/storage
+      # Ingesta OTLP por la red interna (el usuario navega en :6006).
+      ADA_PHOENIX_ENDPOINT: http://phoenix:6006/v1/traces
+    volumes:
+      - ada_storage:/data/storage
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      phoenix:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/openapi.json', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    restart: unless-stopped
+
+  # Worker de ingesta (entrypoint real: worker_cli, loop continuo).
+  worker:
+    image: ada-study-app:latest
+    container_name: ada_study_worker
+    command: sh -c 'python -m ada_study.worker_cli "$$DATABASE_URL"'
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgresql+asyncpg://ada:ada_dev_password@postgres:5432/ada_study
+      ADA_STORAGE_DIR: /data/storage
+    volumes:
+      - ada_storage:/data/storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # UI Streamlit: llama a la API desde la red interna (ADA_API_BASE_URL).
+  ui:
+    image: ada-study-app:latest
+    container_name: ada_study_ui
+    command: streamlit run src/ada_study/ui/app.py --server.address 0.0.0.0 --server.port 8501 --server.headless true
+    environment:
+      ADA_API_BASE_URL: http://api:8000
+    ports:
+      - "8501:8501"
+    depends_on:
+      api:
+        condition: service_started
+    restart: unless-stopped
 
 volumes:
   ada_pgdata:
+  ada_storage:
 

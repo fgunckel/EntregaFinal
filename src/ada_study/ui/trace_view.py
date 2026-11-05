@@ -24,6 +24,7 @@ from dataclasses import dataclass
 import streamlit as st
 
 from ada_study.contracts.trace import Trace, TraceEvent
+from ada_study.ui.theme import pill_markup
 
 # Orden y nombres de los cinco agentes (AGENT-TRACE-02 §4.2).
 AGENT_ORDER = ("supervisor", "researcher", "tutor", "validator", "synthesizer")
@@ -60,13 +61,25 @@ TRACE_UNAVAILABLE = "La trazabilidad de esta consulta no está disponible."
 DETAIL_LABEL = "Ver detalle"
 
 # Estados visuales (AGENT-TRACE-02 §4.2), derivados SOLO de los eventos.
+# UI-REDESIGN-03: sin emojis — el estado se comunica con la pastilla global
+# (theme.pill_markup) vía STATE_TONES (color semántico, misma jerarquía).
 STATE_LABELS = {
-    "completed": "✅ Completado",
-    "running": "🔄 En ejecución",
-    "skipped": "⏭️ Omitido",
-    "warning": "⚠️ Advertencia",
-    "error": "❌ Error",
-    "unknown": "❔ Sin información disponible",
+    "completed": "Completado",
+    "running": "En ejecución",
+    "skipped": "Omitido",
+    "warning": "Advertencia",
+    "error": "Error",
+    "unknown": "Sin información disponible",
+}
+
+# Tono de la pastilla por estado (mismo vocabulario que ui.theme).
+STATE_TONES = {
+    "completed": "ok",
+    "running": "accent",
+    "warning": "warn",
+    "error": "danger",
+    "skipped": "neutral",
+    "unknown": "neutral",
 }
 
 # Modo real de ejecución del tutor (evento decision.details.mode).
@@ -203,6 +216,12 @@ def _researcher_details(events: list[TraceEvent]) -> list[str]:
                 lines.append(
                     f"- Restricción de fuentes (no acredita pertinencia): "
                     f"{', '.join(restricted)}"
+                )
+            ordinals = details.get("ordinal_terms")
+            if ordinals:
+                lines.append(
+                    f"- Ordinales de grado (no acreditan pertinencia): "
+                    f"{', '.join(ordinals)}"
                 )
             retrieved = details.get("retrieved_chunks")
             if retrieved is not None:
@@ -371,12 +390,27 @@ def trace_notes(trace: Trace) -> list[tuple[str, str]]:
 
 
 def render_agent_view(view: AgentTraceView) -> None:
-    """Fila del agente: nombre, estado real, resumen y detalle expandido."""
-    header = f"**{view.name}** · {STATE_LABELS[view.state]}"
+    """Fila de la línea de tiempo del agente (UI-REDESIGN-03).
+
+    Nombre + pastilla de estado real + duración; la responsabilidad queda
+    como pie discreto, el resumen es la línea principal y el detalle técnico
+    queda expandido a pedido. El timeline se dibuja con CSS propio (clases
+    ``ada-trace-*``), sin emojis ni selectores internos de Streamlit.
+    """
+    pill = pill_markup(STATE_LABELS[view.state], STATE_TONES[view.state])
+    header = f'<div class="ada-trace-head"><strong>{view.name}</strong>{pill}'
     if view.duration_ms is not None:
-        header += f" · {_format_duration(view.duration_ms)}"
-    st.markdown(header)
-    st.caption(view.responsibility)
+        header += (
+            f'<span class="ada-trace-dur">{_format_duration(view.duration_ms)}'
+            "</span>"
+        )
+    header += "</div>"
+    st.markdown(
+        '<div class="ada-trace-row"><span class="ada-trace-dot"></span>'
+        f"{header}"
+        f'<p class="ada-trace-resp">{view.responsibility}</p></div>',
+        unsafe_allow_html=True,
+    )
     if view.summary:
         st.markdown(view.summary)
     if view.details:
@@ -405,7 +439,17 @@ def render_trace(trace: Trace | None) -> None:
                 st.error(message)
             else:
                 st.warning(message)
+        # Identificadores técnicos: SECCIÓN SECUNDARIA, con posibilidad de
+        # copia (st.code) y etiquetas que no se confunden con el UUID de
+        # conversación de la app (§5). Nunca se muestra el id de conversación
+        # de la app, solo el hilo interno del checkpointer.
         identifiers = f"ID de traza: `{trace.trace_id}`"
         if trace.conversation_id:
             identifiers += f" · Hilo del checkpointer: `{trace.conversation_id}`"
-        st.caption(identifiers)
+        with st.expander("Datos técnicos"):
+            st.caption(identifiers)
+            st.code(
+                f"trace_id = {trace.trace_id}\n"
+                f"conversation_id = {trace.conversation_id or '—'}",
+                language=None,
+            )

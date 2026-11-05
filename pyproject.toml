@@ -13,6 +13,11 @@ dependencies = [
     "langgraph>=0.2,<2.0",
     "fastapi>=0.115,<1.0",
     "uvicorn[standard]>=0.30,<1.0",
+    # Checkpointer de conversaciones (CHECKPOINTER-01): AsyncPostgresSaver
+    # usa psycopg3 (no asyncpg). Necesarios cuando
+    # ADA_CONVERSATIONS_ENABLED=true (API en contenedor incluida).
+    "langgraph-checkpoint-postgres>=3.2,<4.0",
+    "psycopg[binary,pool]>=3.2,<4.0",
 ]
 
 [project.optional-dependencies]

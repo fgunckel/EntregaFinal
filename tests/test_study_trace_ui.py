@@ -315,7 +315,7 @@ class TestAgentViews:
         assert _view(views, "supervisor").state == "completed"
         assert _view(views, "researcher").state == "completed"
         assert _view(views, "tutor").state == "running"
-        assert STATE_LABELS[_view(views, "tutor").state] == "🔄 En ejecución"
+        assert STATE_LABELS[_view(views, "tutor").state] == "En ejecución"
         assert _view(views, "validator").state == "unknown"
         assert _view(views, "synthesizer").state == "unknown"
         notes = trace_notes(trace)
@@ -370,7 +370,7 @@ class TestAgentViews:
         events = [*_supervisor_events("researcher"), *_researcher_events()]
         views = build_agent_views(_trace("tr_1", events))
         assert _view(views, "synthesizer").state == "skipped"
-        assert STATE_LABELS["skipped"] in ("⏭️ Omitido",)
+        assert STATE_LABELS["skipped"] in ("Omitido",)
 
 # ---------------------------------------------------------------------------
 # Casos 1, 3, 7, 8 y 10 (AppTest): página Estudiar con cliente falso
@@ -399,9 +399,9 @@ def _run_study(monkeypatch: pytest.MonkeyPatch, responses: list[StudyResponse]):
 
 
 def _ask(at: AppTest, question: str) -> None:
-    at.text_area(key="ada_study_request").set_value(question).run()
-    assert not at.exception, [e.value for e in at.exception]
-    next(button for button in at.button if button.label == "Consultar").click().run()
+    # UI-REDESIGN-03: el formulario se migró a st.chat_input (misma key
+    # contractual `ada_study_request`); el envío es el Enter del propio input.
+    at.chat_input(key="ada_study_request").set_value(question).run()
     assert not at.exception, [e.value for e in at.exception]
 
 
@@ -482,8 +482,13 @@ class TestStudyPageTrace:
         _ask(at, "Con trace")
         _ask(at, "Sin trace")
         assert not at.exception
-        labels = [expander.label for expander in at.expander]
-        assert "Turnos anteriores (1)" in labels
+        # UI-REDESIGN-03: el historial ya no es el expander «Turnos anteriores»
+        # sino el chat visible (pregunta del usuario por turno). El turno sin
+        # trace NO rompe la página: la segunda respuesta informa la
+        # indisponibilidad en su propio bloque (TRACE_UNAVAILABLE).
+        questions = [md.value for md in at.markdown]
+        assert any("Con trace" in value for value in questions)
+        assert any("Sin trace" in value for value in questions)
         captions = [c.value for c in at.caption]
         assert any("ID de traza: `tr_uno`" in value for value in captions)
         assert any(TRACE_UNAVAILABLE in value for value in captions)

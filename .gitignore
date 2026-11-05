@@ -24,3 +24,12 @@ ADA_Study.zip
 # Secretos locales (LLM-CONFIG-01): la clave del proveedor LLM nunca se versiona
 .env
 .env.local
+
+# Artefactos generados (FINAL-03): bytecode, caches y datos de ejecucion
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.ada_storage/
+.coda/tmp/

@@ -74,9 +74,17 @@ Clasificación de la consulta y restricciones de fuentes (RAG-QUALITY-05):
   ningún término, se conserva el comportamiento anterior (los términos
   objetivo completos): una consulta cuyo tema ES la fuente ("explicame el
   material de Historia") no puede quedar sin criterio de pertinencia.
+- Ordinales de grado/posición (SMOKE-FIX-01: "quinto", "segunda", ...):
+  califican metadatos del material ("5.º grado"), no el contenido, y pueden
+  NO existir en el corpus (el PDF escribe «5.º»/«5to» y la consulta dice
+  «quinto»). Sin excluirlos, el umbral min(2, |temáticos|) exigía una
+  coincidencia estructuralmente imposible y BM25 devolvía exactamente el
+  documento pedido solo para verlo rechazado entero (falso negativo). Como
+  los marcadores: NO acreditan pertinencia; la RECUPERACIÓN no cambia.
 
 """
 
+import re
 import unicodedata
 
 from ada_study.contracts.study import SourceReference
@@ -181,6 +189,68 @@ def _is_discourse_marker(term: str) -> bool:
     if base.endswith("s") and len(base) > 3:
         candidates.add(base[:-1])
     return bool(candidates & _DISCOURSE_MARKERS)
+
+
+# ---------------------------------------------------------------------------
+# Ordinales de grado (SMOKE-FIX-01): califican METADATOS del material.
+# ---------------------------------------------------------------------------
+
+# Ordinales que en el corpus escolar califican metadatos del documento
+# ("5.º grado", "quinto grado", "segunda parte") y nunca el tema solicitado.
+# El defecto observado (SMOKE-FIX-01): con «historia de quinto grado», el
+# PDF escribe el grado como «5.º»/«5to», así que "quinto" tiene df=0; como
+# NO era genérico (df=0 < 3) contaba como temático e inflaba el umbral
+# min(2, |temáticos|) a 2 coincidencias ESTRUCTURALMENTE imposibles: BM25
+# recuperaba exactamente los fragmentos del documento pedido y el filtro los
+# rechazaba a todos → `insufficient_evidence` sin referencias. Un ordinal no
+# identifica contenido: NO acredita pertinencia (como los marcadores), pero
+# SÍ alimenta la recuperación BM25 (que no cambia).
+# RAG-RUNTIME-01: la detección se extiende a las formas ABREVIADAS que el
+# propio corpus usa («5to», «5.º», «2da», «7mo», «1er») — son el mismo tipo
+# de calificador de metadatos y sin ellas el falso negativo reaparece cuando
+# el estudiante escribe el grado abreviado (grafía con df=0 en el corpus).
+_ORDINAL_TERMS = frozenset(
+    _normalize(term)
+    for term in (
+        "primero", "primera", "primer", "segundo", "segunda", "tercero",
+        "tercera", "tercer", "cuarto", "cuarta", "quinto", "quinta",
+        "sexto", "sexta", "septimo", "septima", "octavo", "octava",
+        "noveno", "novena", "decimo", "decima",
+    )
+)
+
+# Formas abreviadas de ordinal español: dígito + sufijo ordinal, con o sin
+# símbolo («5to», «5ta», «5.º», «2do», «2da», «3ro», «3er», «7mo», «10.°»),
+# tolerando plural simple («5tos»). Solo 1-3 dígitos: números de contenido
+# (fechas como "1810") siguen siendo términos temáticos normales.
+_ORDINAL_ABBREVIATION_RE = re.compile(
+    r"^\d{1,3}(?:[º°ª]|[nrdtmv][oa]|er)s?$",
+    re.IGNORECASE,
+)
+
+
+def _is_ordinal_term(term: str) -> bool:
+    """True si el término es un ordinal de grado/posición (SMOKE-FIX-01).
+
+    Cubre las formas plenas («quinto») y las abreviadas («5to», «2da»,
+    «7mo», «1er», «5.º», «5tos») que el tokenizer emite como un solo token
+    (`\\w+` no separa dígitos de letras). Tolera plural simple
+    (segundo/segundos), igual que `_term_matches`. Un ordinal califica
+    metadatos del material (grado, unidad, parte): no acredita pertinencia
+    temática y no debe inflar el umbral de coincidencias exigidas por
+    fragmento (falso negativo estructural). Números desnudos (fechas,
+    cantidades: "1810", "5") NO son ordinales: siguen contando como
+    contenido para no relajar la pertinencia.
+    """
+    base = _normalize(term).lower()
+    candidates = {base}
+    if base.endswith("es") and len(base) > 4:
+        candidates.add(base[:-2])
+    if base.endswith("s") and len(base) > 3:
+        candidates.add(base[:-1])
+    if candidates & _ORDINAL_TERMS:
+        return True
+    return bool(_ORDINAL_ABBREVIATION_RE.fullmatch(base))
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +385,14 @@ def make_researcher_node(retriever):
         # material de Historia y Matemática que tenés disponible") tampoco
         # acreditan pertinencia: el tema central es lo que quedó fuera de esa
         # cláusula. La RECUPERACIÓN (retrieval_query) no cambia.
+        # SMOKE-FIX-01: los ordinales de grado ("quinto" en «historia de
+        # quinto grado») califican metadatos del material y pueden NO existir
+        # en el corpus (el PDF escribe «5.º»): sin excluirlos inflan el
+        # umbral de coincidencias y vuelven la aceptación imposible (falso
+        # negativo estructural). La RECUPERACIÓN no cambia.
+        ordinal_terms = [
+            term for term in significant_terms(query) if _is_ordinal_term(term)
+        ]
         restriction_terms = _source_restriction_terms(query)
         restriction_bases = frozenset(
             _normalize(term).lower() for term in restriction_terms
@@ -323,6 +401,7 @@ def make_researcher_node(retriever):
             term
             for term in significant_terms(query)
             if not _is_discourse_marker(term)
+            and not _is_ordinal_term(term)
             and _normalize(term).lower() not in restriction_bases
         ]
         if contextual and topic:
@@ -434,6 +513,7 @@ def make_researcher_node(retriever):
                 "target_terms": list(target_terms),
                 "thematic_terms": list(thematic_terms),
                 "source_restriction_terms": sorted(restriction_terms),
+                "ordinal_terms": sorted(ordinal_terms),
                 "required_matches": required,
             },
         )

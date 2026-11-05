@@ -1,0 +1,28 @@
+# ADA Study — tema visual «Tinta y aula» (UI-REDESIGN-02, etapa 0).
+# UBICACIÓN: raíz del repositorio. Streamlit resuelve este archivo desde el
+# CWD del proceso (`$CWD/.streamlit/config.toml`, además de ~/.streamlit);
+# el servicio `ui` de Docker Compose corre `streamlit run ...` con WORKDIR
+# /app, por lo que el Dockerfile copia este directorio a /app/.streamlit
+# (sin esa línea el tema NO llega al despliegue).
+# Tokens: docs/ui/UI_REDESIGN_PROPOSAL.md §5 — papel cálido, superficies
+# blancas, acento índigo único, tinta oscura, bordes cálidos, pila del
+# sistema (sin fuentes externas, sin dependencias nuevas).
+
+[theme]
+base = "light"
+primaryColor = "#4338CA"
+backgroundColor = "#FAF9F7"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#1A1D29"
+font = "sans serif"
+borderColor = "#E8E5E0"
+baseRadius = "medium"
+
+# SMOKE-FIX-01: el script principal (src/ada_study/ui/app.py) tiene al lado
+# un directorio `pages/` con los módulos de la UI, así que Streamlit los
+# detecta como multipágina clásica e inyecta SU PROPIA navegación en el
+# sidebar (duplicada con el menú personalizado `ada_nav`). La navegación
+# automática se desactiva aquí: el router sigue siendo el st.radio del app
+# y las páginas se siguen ejecutando por función (sin tocar el router).
+[client]
+showSidebarNavigation = false
